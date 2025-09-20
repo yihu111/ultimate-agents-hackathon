@@ -1,4 +1,5 @@
-import io, os, time, base64
+# main.py
+import io, os, time
 from typing import Dict, Optional, List, Literal
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,14 +10,14 @@ from supabase import create_client, Client
 import httpx
 
 # =========================================================
-# Load env
+# Load environment
 # =========================================================
 load_dotenv()
 
 # Supabase config
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-BUCKET = "images"  # your bucket name
+BUCKET = "images"  # ensure this bucket exists and is public
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_ANON_KEY in your .env")
@@ -24,13 +25,12 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 def public_url(path: str) -> str:
-    """Build a public URL for an object (bucket must be public)."""
+    """Public URL for a file in the 'images' bucket (bucket must be public)."""
     base = SUPABASE_URL.rstrip("/")
     return f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
 
 def supabase_upload_bytes(path: str, data: bytes, content_type: str) -> str:
     """Upload bytes to Supabase Storage (upsert), return public URL."""
-    # Upsert so you can overwrite during demo
     supabase.storage.from_(BUCKET).upload(
         path, data, {"content-type": content_type, "upsert": True}
     )
@@ -40,15 +40,16 @@ def supabase_upload_bytes(path: str, data: bytes, content_type: str) -> str:
 AGENT_BASE_URL = os.environ.get("AGENT_BASE_URL", "http://localhost:9000")
 AGENT_API_KEY = os.environ.get("AGENT_API_KEY")
 
-WEBHOOK_SECRET = os.environ.get("ADGRID_WEBHOOK_SECRET")  # optional shared secret for webhooks
+# Optional: shared secret for webhooks from agent
+WEBHOOK_SECRET = os.environ.get("ADGRID_WEBHOOK_SECRET")  # e.g., "super-secret"
 
 # =========================================================
 # FastAPI setup
 # =========================================================
-app = FastAPI(title="AdGrid + Agent + Supabase API", version="7.0.0")
+app = FastAPI(title="AdGrid + Agent + Supabase API", version="7.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten for prod
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,11 +61,10 @@ app.add_middleware(
 CURRENT_PROMPT: Optional[str] = None
 CURRENT_INPUT_URL: Optional[str] = None
 CURRENT_INGESTION_ID: Optional[str] = None
-GRID_SHAPE = {"rows": 3, "cols": 3}
 
-# Base items (variant=0) and variations (variant>=1)
-GRID_ITEMS: Dict[int, "ImageItem"] = {}
-VAR_ITEMS: Dict[int, List["ImageItem"]] = {}
+GRID_SHAPE = {"rows": 3, "cols": 3}
+GRID_ITEMS: Dict[int, "ImageItem"] = {}          # base (variant=0)
+VAR_ITEMS: Dict[int, List["ImageItem"]] = {}     # variations (variant>=1)
 
 # =========================================================
 # Models
@@ -75,12 +75,12 @@ ImageStatus = Literal["queued", "running", "done", "error"]
 class ImageItem(BaseModel):
     slot: int
     variant: int                 # 0 for base, >=1 for variations
-    url: Optional[str]           # may be None while queued/running
+    url: Optional[str]           # Supabase (or agent) public URL
     kind: ImageKind              # "base" | "variation"
     status: ImageStatus = "running"
-    version: int = 0             # bump on each update
-    updatedAt: int = 0           # epoch ms
-    meta: Optional[Dict] = None  # agent-supplied metadata
+    version: int = 0
+    updatedAt: int = 0
+    meta: Optional[Dict] = None  # any metadata from the agent
 
 class UploadResp(BaseModel):
     prompt: Optional[str]
@@ -143,7 +143,6 @@ def _progress(rows: int, cols: int) -> Dict[str, int]:
 def _grid_status(rows: int, cols: int) -> ImageStatus:
     prog = _progress(rows, cols)
     if prog["done"] == 0:
-        # queued if nothing started, running otherwise
         any_started = any(GRID_ITEMS.get(s) for s in range(1, rows * cols + 1))
         return "running" if any_started else "queued"
     if prog["done"] < (rows * cols):
@@ -151,8 +150,7 @@ def _grid_status(rows: int, cols: int) -> ImageStatus:
     return "done"
 
 # =========================================================
-# Agent Client (HTTP)
-# - Adjust paths/body to match your agent if needed
+# Agent HTTP client
 # =========================================================
 class AgentClient:
     def __init__(self, base_url: str, api_key: Optional[str] = None):
@@ -168,12 +166,15 @@ class AgentClient:
     async def ingest_url(self, image_url: str, prompt: Optional[str]) -> Optional[str]:
         """
         POST {AGENT}/ingest  { prompt, image_url } → { ingestion_id? }
+        If your agent doesn't support this, it's fine to return None.
         """
         payload = {"prompt": prompt, "image_url": image_url}
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(f"{self.base_url}/ingest", headers=self._headers(), json=payload)
-            r.raise_for_status()
-            data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+            # If your agent has no /ingest, you can ignore errors by returning None.
+            if r.status_code >= 400:
+                return None
+            data = r.json() if "application/json" in r.headers.get("content-type","") else {}
             return data.get("ingestion_id")
 
     async def generate_grid(self, rows: int, cols: int,
@@ -199,11 +200,11 @@ class AgentClient:
         for raw in data.get("items", []):
             slot = int(raw["slot"])
             url = raw.get("url")
-            base_prev = _ensure_base(slot)
+            prev = _ensure_base(slot)
             out.append(ImageItem(
                 slot=slot, variant=0, kind="base",
                 url=url, status="done" if url else "running",
-                version=base_prev.version + 1, updatedAt=_now_ms(),
+                version=prev.version + 1, updatedAt=_now_ms(),
                 meta=raw.get("meta"),
             ))
         return out
@@ -260,13 +261,13 @@ def set_meta(body: MetaSetReq):
     return MetaResp(prompt=CURRENT_PROMPT)
 
 # =========================================================
-# Upload: save to Supabase (images/input.png|jpg) and notify Agent
+# Upload: save input to Supabase (images/input.png|jpg) + notify Agent
 # =========================================================
 @app.post("/upload", response_model=UploadResp)
 async def upload_reference(file: UploadFile = File(...), prompt: Optional[str] = Form(None)):
     global CURRENT_PROMPT, CURRENT_INPUT_URL, CURRENT_INGESTION_ID, GRID_ITEMS, VAR_ITEMS
     if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File must be an image (png/jpeg/webp…).")
+        raise HTTPException(400, "File must be an image (png/jpeg/webp…)")
 
     raw = await file.read()
     try:
@@ -287,17 +288,16 @@ async def upload_reference(file: UploadFile = File(...), prompt: Optional[str] =
     GRID_ITEMS.clear()
     VAR_ITEMS.clear()
 
-    # Notify agent (optional but recommended)
+    # Optional: tell the agent where the input image lives
     try:
         CURRENT_INGESTION_ID = await AGENT.ingest_url(image_url=CURRENT_INPUT_URL, prompt=CURRENT_PROMPT)
     except Exception:
         CURRENT_INGESTION_ID = None  # fine for hackathon
 
-    return UploadResp(prompt=prompt, input_url= CURRENT_INPUT_URL, ingestion_id=CURRENT_INGESTION_ID)
+    return UploadResp(prompt=prompt, input_url=CURRENT_INPUT_URL, ingestion_id=CURRENT_INGESTION_ID)
 
 # =========================================================
-# Generate grid (Agent returns URLs in JSON)
-# Frontend should poll GET /grid until status === "done"
+# Generate grid via Agent (frontend then polls /grid)
 # =========================================================
 @app.post("/generate", response_model=GridResp)
 async def generate_grid(rows: int = 3, cols: int = 3):
@@ -305,13 +305,12 @@ async def generate_grid(rows: int = 3, cols: int = 3):
     GRID_SHAPE["rows"], GRID_SHAPE["cols"] = rows, cols
     total = rows * cols
 
-    # mark all as running immediately so UI shows spinners
+    # mark as running immediately for UI
     for slot in range(1, total + 1):
         base = _ensure_base(slot)
         base.status = "running"
         base.updatedAt = _now_ms()
 
-    # call agent for actual URLs
     try:
         items = await AGENT.generate_grid(
             rows=rows, cols=cols,
@@ -330,7 +329,7 @@ async def generate_grid(rows: int = 3, cols: int = 3):
                     items=[GRID_ITEMS[s] for s in range(1, total + 1)])
 
 # =========================================================
-# Poll grid
+# Poll grid (frontend polls this every ~1–2s)
 # =========================================================
 @app.get("/grid", response_model=GridResp)
 def get_grid():
@@ -342,8 +341,7 @@ def get_grid():
     return GridResp(status=status, rows=rows, cols=cols, progress=prog, items=items)
 
 # =========================================================
-# Per-slot regenerate (re-call agent for this slot)
-# (We reuse generate_grid(rows=1, cols=1) and map result to this slot)
+# Regenerate a single base slot (re-call agent for one)
 # =========================================================
 @app.post("/slot/{slot}/generate", response_model=ImageItem)
 async def generate_slot(slot: int):
@@ -357,6 +355,7 @@ async def generate_slot(slot: int):
     base.updatedAt = _now_ms()
 
     try:
+        # Simple reuse: ask agent for 1x1 and map it to this slot
         items = await AGENT.generate_grid(
             rows=1, cols=1,
             prompt=CURRENT_PROMPT,
@@ -365,7 +364,7 @@ async def generate_slot(slot: int):
         )
         if items:
             result = items[0]
-            result.slot = slot  # remap to target slot if agent returned slot=1
+            result.slot = slot
             GRID_ITEMS[slot] = result
         else:
             base.status = "error"
@@ -388,7 +387,7 @@ def get_slot(slot: int):
     return SlotResp(slot=slot, items=[base] + variations)
 
 # =========================================================
-# Generate variations (Agent returns 3 URLs, append to state)
+# Generate N variations for a slot (Agent returns URLs)
 # =========================================================
 @app.post("/slot/{slot}/variations/generate", response_model=SlotResp)
 async def generate_variations(slot: int, body: VariationsGenerateReq = VariationsGenerateReq()):
@@ -425,13 +424,11 @@ async def regenerate_slots(body: RegenReq):
     if invalid:
         raise HTTPException(400, f"Invalid slots: {invalid}")
 
-    # Mark running
     for s in body.slots:
         b = _ensure_base(s)
         b.status = "running"
         b.updatedAt = _now_ms()
 
-    # Simple approach: re-call agent for the full grid and only replace requested slots
     try:
         items = await AGENT.generate_grid(
             rows=rows, cols=cols,
@@ -451,7 +448,7 @@ async def regenerate_slots(body: RegenReq):
                     items=[_ensure_base(s) for s in range(1, total + 1)])
 
 # =========================================================
-# Optional webhooks from Agent to update statuses/URLs
+# Optional webhooks for agent to push updates
 # =========================================================
 @app.post("/slot/{slot}/status", response_model=ImageItem)
 def slot_status_webhook(slot: int, payload: SlotUpdate, x_adgrid_secret: Optional[str] = Header(None)):
@@ -482,12 +479,12 @@ def variation_status_webhook(slot: int, variant: int, payload: SlotUpdate, x_adg
             raise HTTPException(401, "Unauthorized")
 
     base = _ensure_base(slot)
-    lst = VAR_ITEMS.get(slot, [])
-    v = next((x for x in lst if x.variant == variant), None)
+    variations = VAR_ITEMS.get(slot, [])
+    v = next((x for x in variations if x.variant == variant), None)
     if v is None:
         v = ImageItem(slot=slot, variant=variant, kind="variation",
                       url=None, status="running", version=base.version, updatedAt=_now_ms())
-        lst.append(v)
+        variations.append(v)
 
     if payload.status:
         v.status = payload.status
@@ -497,11 +494,11 @@ def variation_status_webhook(slot: int, variant: int, payload: SlotUpdate, x_adg
         v.meta = payload.meta
     v.version = payload.version if payload.version is not None else (v.version + 1)
     v.updatedAt = _now_ms()
-    VAR_ITEMS[slot] = lst
+    VAR_ITEMS[slot] = variations
     return SlotResp(slot=slot, items=[base] + VAR_ITEMS[slot])
 
 # =========================================================
-# Reset
+# Reset all state
 # =========================================================
 @app.delete("/reset")
 def reset_all():
