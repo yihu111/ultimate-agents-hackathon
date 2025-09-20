@@ -5,8 +5,7 @@ from typing import Dict, Any
 
 from dotenv import load_dotenv, find_dotenv
 
-from product_images.product_images_graph import ProductImagesState, compile_graph
-
+from langgraph_workflow.product_images_graph import ProductImagesState, compile_graph
 
 load_dotenv(find_dotenv())
 
@@ -35,6 +34,8 @@ async def main() -> None:
             "A soft plush toy product suitable for infants, featuring friendly animal shapes."
         ),
         "extra_guidance": "Target audience is mothers with babies.",
+        "num_dimensions": 2,
+        "num_values_per_dim": 3,
         "image_model": image_model,
         "use_raw_mode": use_raw_mode,
         "results": [],
