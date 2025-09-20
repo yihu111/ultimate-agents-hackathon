@@ -45,37 +45,45 @@ async def simple_image_agent():
     }
     """
     
-    try:
-        response = await runner.run(
-            input=prompt,
-            model="openai/gpt-4o",
-            mcp_servers=["yihu/flux-mcp"],
-            stream=False
-        )
+    # Try different MCP servers
+    mcp_servers_to_try = ["lucas120301/BFL_mcp_server"]
+    
+    for mcp_server in mcp_servers_to_try:
+        print(f"\n🔍 Trying MCP server: {mcp_server}")
+        try:
+            response = await runner.run(
+                input=prompt,
+                model="openai/gpt-4o",
+                mcp_servers=[mcp_server],
+                stream=False
+            )
         
-        print("✅ MCP response received!")
-        print("Raw response:")
-        print(response.final_output)
-        
-        # Parse JSON
-        response_text = response.final_output.strip()
-        if response_text.startswith("{"):
-            json_text = response_text
-        else:
-            start = response_text.find("{")
-            end = response_text.rfind("}") + 1
-            json_text = response_text[start:end]
-        
-        data = json.loads(json_text)
-        
-        print("\n✅ Structured output:")
-        print(f"Prompt: {data['prompt_used']}")
-        print(f"Success: {data['generation_success']}")
-        print(f"Image: {data['image_data'][:50]}...")
-        
-    except Exception as e:
-        print(f"❌ MCP Error: {e}")
-        print("This might be an issue with the Flux MCP server or your API keys")
+            print(f"✅ MCP server {mcp_server} works!")
+            print("Raw response:")
+            print(response.final_output)
+            
+            # Parse JSON
+            response_text = response.final_output.strip()
+            if response_text.startswith("{"):
+                json_text = response_text
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                json_text = response_text[start:end]
+            
+            data = json.loads(json_text)
+            
+            print("\n✅ Structured output:")
+            print(f"Prompt: {data['prompt_used']}")
+            print(f"Success: {data['generation_success']}")
+            print(f"Image: {data['image_data'][:50]}...")
+            return  # Success, exit the function
+            
+        except Exception as e:
+            print(f"❌ MCP server {mcp_server} failed: {e}")
+            continue  # Try next MCP server
+    
+    print("\n❌ All MCP servers failed. The Flux MCP server might be down or unavailable.")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
-# dedalus_product_images/product_images_graph.py
-from typing import TypedDict, Dict, List, Optional, Annotated
+# product_images/product_images_graph.py
+from typing import TypedDict, Dict, List, Optional, Annotated, NotRequired
 from operator import add
-import asyncio
+
+from pydantic import BaseModel, Field, constr
 from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 import base64
@@ -17,17 +18,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
 
-# Import Dedalus Labs components
-from dedalus_labs import AsyncDedalus, DedalusRunner
-
-# Import original components for local execution
-# Note: FluxAdapter and DiffusionPrompt imports removed since we're using Dedalus agents
-# from adapters.flux_adapter import FluxAdapter
-# from models.diffusion_prompt import DiffusionPrompt
-
-from dedalus_product_images.prompts import (
+from adapters.flux_adapter import FluxAdapter
+from models.diffusion_prompt import DiffusionPrompt
+from langgraph_workflow.prompts import (
     DIMENSIONS_SYSTEM,
     build_dimensions_human,
     PROMPT_SYSTEM,
@@ -35,12 +29,6 @@ from dedalus_product_images.prompts import (
 )
 
 load_dotenv(find_dotenv())
-
-# Python 3.10 compatibility
-try:
-    from typing import NotRequired
-except ImportError:
-    NotRequired = Optional
 
 
 # ---------- Pydantic models (LLM structured outputs / requests) ----------
@@ -146,7 +134,6 @@ async def init_run_output(state: ProductImagesState) -> Dict:
         "prompts_dir": str(prompts_dir),
     }
 
-
 async def propose_dimensions(state: ProductImagesState) -> Dict:
     llm = ChatOpenAI(model=state["model_spec"]["name"]).with_structured_output(VariationPlan)
     num_dims = state.get("num_dimensions", 2)
@@ -227,25 +214,16 @@ async def split_to_variations(state: ProductImagesState):
                 images_dir=images_dir,
                 prompts_dir=prompts_dir,
             )
-            sends.append(Send("dedalus_prompt_and_generate", req))
+            sends.append(Send("prompt_and_generate", req))
     return sends
 
 
-async def dedalus_prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
-    """
-    Dedalus agent that handles both prompt generation and image creation using Dedalus agents.
-    Uses Dedalus for both tasks instead of direct LangGraph functions.
-    """
-    print(f"🎨 Dedalus Agent: Generating image for {request.dim_a_value} x {request.dim_b_value}")
-    
-    # Initialize Dedalus client
-    client = AsyncDedalus()
-    runner = DedalusRunner(client)
-    
-    try:
-        # 1) Use Dedalus agent for prompt generation with both system and human prompts
-        # Build the human prompt using the original function
-        human_prompt = build_prompt_human(
+async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
+    # 1) Create prompt (LLM structured)
+    llm = ChatOpenAI(model=request.model_spec["name"]).with_structured_output(GeneratedDiffusionPrompt)
+    raw = await llm.ainvoke([
+        AIMessage(content=PROMPT_SYSTEM),
+        build_prompt_human(
             request.product_description,
             request.extra_guidance,
             request.dim_a_name,
@@ -253,170 +231,78 @@ async def dedalus_prompt_and_generate(request: PromptAndGenerateRequest) -> Dict
             request.dim_a_value,
             request.dim_b_value,
         )
-        
-        # Use both prompts separately - Dedalus can handle this
-        prompt_query = f"""
-        {PROMPT_SYSTEM}
-        
-        {human_prompt.content}
-        
-        IMPORTANT: Return ONLY the final diffusion prompt text. Do not include any explanations, formatting, or additional text. Just the prompt that can be used directly for image generation.
-        """
-        
-        prompt_response = await runner.run(
-            input=prompt_query,
-            model="openai/gpt-4o",
-            mcp_servers=[],  # No MCP needed for prompt generation
-            stream=False
-        )
-        
-        # Extract prompt text and clean it up
-        prompt_text = prompt_response.final_output.strip()
-        
-        # Remove any potential formatting or extra text
-        if "Use the uploaded" in prompt_text:
-            # Extract just the prompt part
-            lines = prompt_text.split('\n')
-            prompt_lines = []
-            for line in lines:
-                if line.strip() and not line.strip().startswith(('Generate', 'IMPORTANT', 'The prompt', 'Return')):
-                    prompt_lines.append(line.strip())
-            prompt_text = '\n'.join(prompt_lines)
-        
-        # 2) Use Dedalus agent for image generation with Flux MCP
-        image_query = f"""
-        Use the Flux MCP server to generate an image with this prompt:
-        
-        {prompt_text}
-        
-        Image Generation Parameters:
-        - Model: {request.image_model}
-        - Raw Mode: {request.use_raw_mode}
-        {f"- Reference Image: {request.reference_image_path}" if request.reference_image_path else ""}
-        
-        IMPORTANT: Use the Flux MCP tools to generate the image and return the result in one of these formats:
-        1. Base64 encoded image data (data:image/png;base64,...)
-        2. URL to the generated image
-        3. File path to the generated image
-        
-        Do not include any explanations or additional text. Just return the image data/URL/path.
-        """
-        
-        image_response = await runner.run(
-            input=image_query,
-            model="openai/gpt-4o-mini",
-            mcp_servers=["yihu/flux-mcp"],  # Using the actual Flux MCP server
-            stream=False
-        )
-        
-        # 3) Parse the image response and save
-        img_path = await parse_and_save_image_response(image_response.final_output, prompt_text, request)
+    ])
+    prompt_out = GeneratedDiffusionPrompt.model_validate(raw) if isinstance(raw, dict) else raw
 
-        return {
-            "results": [{
-                "dim_a_value": request.dim_a_value,
-                "dim_b_value": request.dim_b_value,
-                "prompt_text": prompt_text,
-                "img_path": str(img_path),
-            }]
-        }
-        
-    except Exception as e:
-        print(f"❌ Error in Dedalus agent: {e}")
-        # Fallback: create a placeholder result
-        return {
-            "results": [{
-                "dim_a_value": request.dim_a_value,
-                "dim_b_value": request.dim_b_value,
-                "prompt_text": f"Error generating prompt: {str(e)}",
-                "img_path": "error_placeholder.png",
-            }]
-        }
+    # 2) Generate image (optionally with reference image if present in request)
+    generator = FluxAdapter(model=request.image_model, use_raw_mode=request.use_raw_mode)
+    img_path, meta = await generator.generate(
+        prompt_out.prompt_text,
+        input_image=request.reference_image_path
+    )
 
-
-async def parse_and_save_image_response(image_response: str, prompt_text: str, request: PromptAndGenerateRequest) -> str:
-    """
-    Parse the Dedalus agent's image response and save the image and prompt.
-    Handles unstructured text responses from Dedalus agents.
-    """
-    import base64
-    import requests
-    from urllib.parse import urlparse
-    
-    # Create output directories
+    # 3) Persist outputs into run directories
     out_images = Path(request.images_dir)
     out_prompts = Path(request.prompts_dir)
-    
+
     def _slug(text: str) -> str:
         t = text.lower().strip().replace(" ", "-")
         return re.sub(r"[^a-z0-9_-]+", "", t)
-    
+
     safe_a = _slug(request.dim_a_value)
     safe_b = _slug(request.dim_b_value)
-    
-    filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}.png"
-    saved_path = out_images / filename
-    
-    # Parse the unstructured response from Dedalus agent
-    response_text = image_response.strip()
-    
-    try:
-        # Check for different response formats
-        if response_text.startswith("data:image/"):
-            # Base64 encoded image
-            try:
-                header, b64data = response_text.split(",", 1)
-                mime = header.split(";")[0].split(":")[-1]
-                ext_guess = mime.split("/")[-1] if "/" in mime else "png"
-                ext = f".{ext_guess}" if not ext_guess.startswith(".") else ext_guess
-                filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
-                saved_path = out_images / filename
-                saved_path.write_bytes(base64.b64decode(b64data))
-            except Exception as e:
-                print(f"❌ Error parsing base64 image: {e}")
-                raise
-                
-        elif response_text.startswith("http"):
-            # URL to image
-            try:
-                resp = requests.get(response_text, timeout=30)
-                resp.raise_for_status()
-                ext = Path(urlparse(response_text).path).suffix or ".png"
-                filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
-                saved_path = out_images / filename
-                saved_path.write_bytes(resp.content)
-            except Exception as e:
-                print(f"❌ Error downloading image from URL: {e}")
-                raise
-                
-        elif Path(response_text).exists():
-            # Local file path
-            try:
-                src = Path(response_text)
-                ext = src.suffix if src.suffix else ".png"
-                filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
-                saved_path = out_images / filename
-                shutil.copy(src, saved_path)
-            except Exception as e:
-                print(f"❌ Error copying local file: {e}")
-                raise
-                
-        else:
-            # Fallback: treat as error or create placeholder
-            print(f"⚠️ Unrecognized response format: {response_text[:100]}...")
-            print("Creating placeholder file. Check your MCP tool's response format.")
-            saved_path.write_bytes(b"placeholder_image_data_from_dedalus_mcp")
-            
-    except Exception as e:
-        print(f"❌ Error parsing image response: {e}")
-        # Create error placeholder
-        saved_path.write_bytes(b"error_parsing_image_response")
-    
+
+    def _ext_from_url(u: str) -> str:
+        path = urlparse(u).path
+        suf = Path(path).suffix
+        return suf if suf else ".png"
+
+    saved_path: Path
+    if isinstance(img_path, str) and img_path.startswith("http"):
+        ext = _ext_from_url(img_path)
+        filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = out_images / filename
+        resp = requests.get(img_path, timeout=30)
+        resp.raise_for_status()
+        saved_path.write_bytes(resp.content)
+    elif isinstance(img_path, str) and img_path.startswith("data:"):
+        # data URL: data:image/png;base64,....
+        try:
+            header, b64data = img_path.split(",", 1)
+        except ValueError:
+            header, b64data = "data:image/png;base64", img_path
+        mime = header.split(";")[0].split(":")[-1]
+        ext_guess = mime.split("/")[-1] if "/" in mime else "png"
+        ext = f".{ext_guess}" if not ext_guess.startswith(".") else ext_guess
+        filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = out_images / filename
+        saved_path.write_bytes(base64.b64decode(b64data))
+    else:
+        # Assume local filesystem path
+        src = Path(img_path)
+        ext = src.suffix if src.suffix else ".png"
+        filename = f"{safe_a}__{safe_b}__{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = out_images / filename
+        try:
+            shutil.copy(src, saved_path)
+        except Exception:
+            # If copy fails, just write nothing and fallback to original path
+            saved_path = src
+
     # Save prompt text alongside
     prompt_filename = saved_path.stem + ".txt"
-    (out_prompts / prompt_filename).write_text(prompt_text, encoding="utf-8")
-    
-    return str(saved_path)
+    (out_prompts / prompt_filename).write_text(prompt_out.prompt_text, encoding="utf-8")
+
+    # TODO: streaming: emit/send partial result to a sink or use LangGraph .stream events externally
+
+    return {
+        "results": [{
+            "dim_a_value": request.dim_a_value,
+            "dim_b_value": request.dim_b_value,
+            "prompt_text": prompt_out.prompt_text,
+            "img_path": str(saved_path),
+        }]
+    }
 
 
 async def finalize(state: ProductImagesState) -> Dict:
@@ -433,15 +319,15 @@ def compile_graph():
     builder.add_node("propose_dimensions", propose_dimensions)
     builder.add_node("save_run_config", save_run_config)
     builder.add_node("start_variation_fanout", start_variation_fanout)
-    builder.add_node("dedalus_prompt_and_generate", dedalus_prompt_and_generate)  # type: ignore[arg-type]
+    builder.add_node("prompt_and_generate", prompt_and_generate)  # type: ignore[arg-type]
     builder.add_node("finalize", finalize)
 
     builder.add_edge(START, "init_run_output")
     builder.add_edge("init_run_output", "propose_dimensions")
     builder.add_edge("propose_dimensions", "save_run_config")
     builder.add_edge("save_run_config", "start_variation_fanout")
-    builder.add_conditional_edges("start_variation_fanout", split_to_variations, ["dedalus_prompt_and_generate"])
-    builder.add_edge("dedalus_prompt_and_generate", "finalize")
+    builder.add_conditional_edges("start_variation_fanout", split_to_variations, ["prompt_and_generate"])
+    builder.add_edge("prompt_and_generate", "finalize")
     builder.add_edge("finalize", END)
 
     return builder.compile()
