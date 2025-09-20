@@ -19,9 +19,9 @@ from langgraph.types import Send
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
-from product_images.adapters.flux_adapter import FluxAdapter
-from product_images.models.diffusion_prompt import DiffusionPrompt
-from product_images.prompts import (
+from adapters.flux_adapter import FluxAdapter
+from models.diffusion_prompt import DiffusionPrompt
+from langgraph_workflow.prompts import (
     DIMENSIONS_SYSTEM,
     build_dimensions_human,
     PROMPT_SYSTEM,
