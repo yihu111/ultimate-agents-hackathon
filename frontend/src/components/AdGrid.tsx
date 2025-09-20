@@ -1,333 +1,337 @@
 import { useState, useEffect, useCallback } from 'react';
-import { GridCell } from './GridCell';
-import { Toolbar } from './Toolbar';
-import { ImagePreview } from './ImagePreview';
-import { apiService, GenerateResponse } from '@/lib/api';
-import { useToast } from '@/hooks/use-toast';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { GridCell } from '@/components/GridCell';
+import { ImagePreview } from '@/components/ImagePreview';
+import { Toolbar } from '@/components/Toolbar';
+import { Skeleton } from '@/components/ui/skeleton';
+import { apiService, type GridResponse, type ImageItem } from '@/lib/api';
+import { toast } from 'sonner';
+import { ArrowLeft, Save } from 'lucide-react';
 
 interface AdGridProps {
   uploadedImage: File;
   uploadResponse: any;
   onBack: () => void;
+  initialPrompt?: string;
 }
 
-interface GridItem {
-  id: string;
-  imageUrl?: string;
-  isLoading: boolean;
-  index: number;
-  variations?: string[];
-  isGeneratingVariations?: boolean;
+interface SelectedImage {
+  slot: number;
+  imageUrl: string;
+  variationIndex?: number;
 }
 
-export const AdGrid = ({ uploadedImage, uploadResponse, onBack }: AdGridProps) => {
-  const [gridItems, setGridItems] = useState<GridItem[]>([]);
-  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
-  const [previewImage, setPreviewImage] = useState<string | null>(null);
-  const [previewVariations, setPreviewVariations] = useState<string[] | undefined>(undefined);
+const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGridProps) => {
+  const [gridItems, setGridItems] = useState<ImageItem[]>([]);
+  const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([]);
+  const [gridData, setGridData] = useState<GridResponse | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [gridData, setGridData] = useState<GenerateResponse | null>(null);
-  const { toast } = useToast();
+  const [zoomedImage, setZoomedImage] = useState<{ imageUrl: string; variations?: string[] } | null>(null);
+  const [adPrompt, setAdPrompt] = useState(initialPrompt || '');
+  const [isSavingPrompt, setIsSavingPrompt] = useState(false);
+  const [isRegenerating, setIsRegenerating] = useState<Record<number, boolean>>({});
+  const [isGeneratingVariations, setIsGeneratingVariations] = useState<Record<number, boolean>>({});
 
-  // Initialize grid and start generation
   useEffect(() => {
-    const initialItems: GridItem[] = Array.from({ length: 9 }, (_, index) => ({
-      id: `item-${index}`,
-      imageUrl: undefined,
-      isLoading: true,
-      index: index + 1, // 1-indexed for API
-    }));
-    setGridItems(initialItems);
     startGeneration();
-  }, [uploadedImage]);
+  }, []);
 
   const startGeneration = async () => {
     try {
       setIsGenerating(true);
-      // Start generation process
-      await apiService.generateGrid(3, 3);
-      // Start polling for updates
-      pollGrid();
+      
+      // Initialize empty grid items with loading state
+      const initialItems: ImageItem[] = [];
+      for (let i = 1; i <= 9; i++) {
+        initialItems.push({
+          slot: i,
+          variant: 0,
+          url: '',
+          status: 'queued',
+          version: 1,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      setGridItems(initialItems);
+      
+      // Start generation
+      const response = await apiService.generateGrid(3, 3);
+      setGridData(response);
+      
+      // If generation is complete immediately, update grid
+      if (response.status === 'done') {
+        setGridItems(response.items);
+        setIsGenerating(false);
+      } else {
+        // Start polling
+        pollGrid();
+      }
     } catch (error) {
       console.error('Generation failed:', error);
-      toast({
-        title: "Generation Failed",
-        description: "Failed to generate variations. Please try again.",
-        variant: "destructive",
-      });
+      toast.error('Failed to generate images');
+      setIsGenerating(false);
     }
   };
 
   const pollGrid = useCallback(async () => {
     try {
-      const response = await apiService.getGrid(3, 3);
+      const response = await apiService.getGrid();
       setGridData(response);
+      setGridItems(response.items);
       
-      // Update grid items with new images
-      setGridItems(prev => 
-        prev.map(item => ({
-          ...item,
-          imageUrl: response.images[item.index.toString()] || undefined,
-          isLoading: !response.images[item.index.toString()],
-        }))
-      );
-
-      setIsGenerating(response.status !== 'done');
-      
-      // Continue polling if not done
-      if (response.status !== 'done') {
-        setTimeout(pollGrid, 1500);
+      if (response.status === 'done') {
+        setIsGenerating(false);
+        return;
       }
+      
+      // Continue polling every 1-2 seconds
+      setTimeout(pollGrid, 1500);
     } catch (error) {
       console.error('Polling failed:', error);
       setIsGenerating(false);
     }
   }, []);
 
-  const handleItemSelect = (itemId: string) => {
-    setSelectedItems(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(itemId)) {
-        newSet.delete(itemId);
-      } else {
-        newSet.add(itemId);
-      }
-      return newSet;
-    });
-  };
-
-  const handleItemRegenerate = async (itemId: string) => {
-    const item = gridItems.find(item => item.id === itemId);
-    if (!item) return;
-
-    // Set loading state for this item
-    setGridItems(prev =>
-      prev.map(prevItem =>
-        prevItem.id === itemId
-          ? { ...prevItem, isLoading: true, imageUrl: undefined }
-          : prevItem
-      )
+  const handleImageSelect = (slot: number, imageUrl: string, variationIndex?: number) => {
+    const newSelection: SelectedImage = {
+      slot,
+      imageUrl,
+      variationIndex,
+    };
+    
+    const existingIndex = selectedImages.findIndex(img => 
+      img.slot === slot && img.variationIndex === variationIndex
     );
-
-    try {
-      // Regenerate this specific slot
-      const response = await apiService.regenerateSlots([item.index]);
-      
-      // Update the grid with the new image
-      setGridItems(prev =>
-        prev.map(prevItem =>
-          prevItem.id === itemId
-            ? { ...prevItem, isLoading: false, imageUrl: response.images[item.index.toString()] }
-            : prevItem
-        )
-      );
-    } catch (error) {
-      console.error('Regeneration failed:', error);
-      setGridItems(prev =>
-        prev.map(prevItem =>
-          prevItem.id === itemId
-            ? { ...prevItem, isLoading: false }
-            : prevItem
-        )
-      );
-      toast({
-        title: "Regeneration Failed",
-        description: "Failed to regenerate image. Please try again.",
-        variant: "destructive",
-      });
+    
+    if (existingIndex >= 0) {
+      // Remove selection
+      const newSelectedImages = [...selectedImages];
+      newSelectedImages.splice(existingIndex, 1);
+      setSelectedImages(newSelectedImages);
+    } else {
+      // Add selection
+      const newSelectedImages = [...selectedImages, newSelection];
+      setSelectedImages(newSelectedImages);
     }
   };
 
-  const handleItemZoom = (imageUrl?: string, variations?: string[]) => {
-    setPreviewImage(imageUrl || null);
-    setPreviewVariations(variations);
+  const isImageSelected = (slot: number, variationIndex?: number): boolean => {
+    return selectedImages.some(img => 
+      img.slot === slot && img.variationIndex === variationIndex
+    );
   };
 
-  const handleGenerateVariations = async (itemId: string) => {
-    const item = gridItems.find(item => item.id === itemId);
-    if (!item) return;
-
-    // Set generating variations state
-    setGridItems(prev =>
-      prev.map(prevItem =>
-        prevItem.id === itemId
-          ? { ...prevItem, isGeneratingVariations: true }
-          : prevItem
-      )
-    );
-
+  const handleItemRegenerate = async (slot: number) => {
     try {
-      const response = await apiService.generateVariations(item.index, 4);
+      setIsRegenerating({ ...isRegenerating, [slot]: true });
       
-      // Build 2x2 grid: [base, v1, v2, v3] where base is the original image
-      const variationsGrid = [item.imageUrl!];
-      if (response.urls.length >= 3) {
-        variationsGrid.push(...response.urls.slice(0, 3));
-      } else {
-        // Fill remaining slots with available variations
-        variationsGrid.push(...response.urls);
-        while (variationsGrid.length < 4) {
-          variationsGrid.push(item.imageUrl!); // Fallback to base image
-        }
-      }
+      const newItem = await apiService.regenerateSlot(slot);
       
-      // Update the grid with variations (original + 3 new)
-      setGridItems(prev =>
-        prev.map(prevItem =>
-          prevItem.id === itemId
-            ? { 
-                ...prevItem, 
-                isGeneratingVariations: false, 
-                variations: variationsGrid
-              }
-            : prevItem
+      // Update the specific item in the grid
+      setGridItems(prevItems => 
+        prevItems.map(item => 
+          item.slot === slot ? newItem : item
         )
       );
+      
+      toast.success('Image regenerated successfully');
+    } catch (error) {
+      console.error('Regeneration failed:', error);
+      toast.error('Failed to regenerate image');
+    } finally {
+      setIsRegenerating({ ...isRegenerating, [slot]: false });
+    }
+  };
+
+  const handleItemZoom = (imageUrl: string, variations?: string[]) => {
+    setZoomedImage({ imageUrl, variations });
+  };
+
+  const handleGenerateVariations = async (slot: number) => {
+    try {
+      setIsGeneratingVariations({ ...isGeneratingVariations, [slot]: true });
+      
+      // First check if variations already exist
+      const slotData = await apiService.getSlot(slot);
+      
+      if (slotData.items.length > 1) {
+        // Variations already exist, show them
+        const baseItem = slotData.items.find(item => item.variant === 0);
+        const allVariations = slotData.items.map(item => item.url);
+        
+        if (baseItem) {
+          setZoomedImage({ 
+            imageUrl: baseItem.url, 
+            variations: allVariations 
+          });
+        }
+      } else {
+        // Generate new variations
+        const response = await apiService.generateSlotVariations(slot, 3);
+        
+        // Show all variations (base + new ones) in 2x2 grid
+        const allVariations = response.items.map(item => item.url);
+        const baseItem = response.items.find(item => item.variant === 0);
+        
+        if (baseItem) {
+          setZoomedImage({ 
+            imageUrl: baseItem.url, 
+            variations: allVariations 
+          });
+        }
+        
+        toast.success('Variations generated successfully');
+      }
     } catch (error) {
       console.error('Variation generation failed:', error);
-      setGridItems(prev =>
-        prev.map(prevItem =>
-          prevItem.id === itemId
-            ? { ...prevItem, isGeneratingVariations: false }
-            : prevItem
-        )
-      );
-      toast({
-        title: "Variation Generation Failed",
-        description: "Failed to generate variations. Please try again.",
-        variant: "destructive",
-      });
+      toast.error('Failed to generate variations');
+    } finally {
+      setIsGeneratingVariations({ ...isGeneratingVariations, [slot]: false });
     }
   };
 
   const handleRegenerateAll = async () => {
-    const itemsToRegenerate = selectedItems.size > 0 ? 
-      Array.from(selectedItems) : 
-      gridItems.map(item => item.id);
-
-    const slotsToRegenerate = itemsToRegenerate.map(itemId => {
-      const item = gridItems.find(item => item.id === itemId);
-      return item?.index;
-    }).filter(Boolean) as number[];
-
-    // Set loading state for items to be regenerated
-    setGridItems(prev =>
-      prev.map(item => 
-        itemsToRegenerate.includes(item.id)
-          ? { ...item, isLoading: true, imageUrl: undefined }
-          : item
-      )
-    );
-
-    // Clear selection if we regenerated selected items
-    if (selectedItems.size > 0) {
-      setSelectedItems(new Set());
-    }
-
     try {
-      const response = await apiService.regenerateSlots(slotsToRegenerate);
+      setIsGenerating(true);
       
-      // Update grid with new images
-      setGridItems(prev =>
-        prev.map(item => ({
-          ...item,
-          imageUrl: response.images[item.index.toString()] || item.imageUrl,
-          isLoading: itemsToRegenerate.includes(item.id) ? false : item.isLoading,
-        }))
-      );
+      if (selectedImages.length > 0) {
+        // Regenerate only selected images
+        const slotsToRegenerate = [...new Set(selectedImages.map(img => img.slot))];
+        const response = await apiService.regenerateSlots(slotsToRegenerate);
+        setGridItems(response.items);
+        
+        // Clear selections
+        setSelectedImages([]);
+        
+        toast.success(`Regenerated ${slotsToRegenerate.length} selected images`);
+      } else {
+        // Regenerate all images
+        const allSlots = Array.from({ length: 9 }, (_, i) => i + 1);
+        const response = await apiService.regenerateSlots(allSlots);
+        setGridItems(response.items);
+        toast.success('Regenerated all images');
+      }
+      
     } catch (error) {
       console.error('Regeneration failed:', error);
-      // Reset loading states on error
-      setGridItems(prev =>
-        prev.map(item => 
-          itemsToRegenerate.includes(item.id)
-            ? { ...item, isLoading: false }
-            : item
-        )
-      );
-      toast({
-        title: "Regeneration Failed",
-        description: "Failed to regenerate images. Please try again.",
-        variant: "destructive",
-      });
+      toast.error('Failed to regenerate images');
+    } finally {
+      setIsGenerating(false);
     }
   };
-
-  const totalGenerated = gridItems.filter(item => item.imageUrl && !item.isLoading).length;
 
   return (
     <div className="min-h-screen bg-background p-6">
       <div className="mx-auto max-w-7xl">
         {/* Header */}
-        <div className="mb-8 flex items-center justify-between">
+        <div className="mb-8">
           <div>
-            <h1 className="text-3xl font-bold bg-gradient-primary bg-clip-text text-transparent">
-              Generated Variations
-            </h1>
+            <h1 className="text-3xl font-bold">Generated Ad Variations</h1>
             <p className="text-muted-foreground">
               Your ad variations are ready. Select the ones you like best.
             </p>
           </div>
         </div>
 
+        {/* Prompt Section */}
+        {adPrompt && (
+          <div className="mb-6 rounded-lg border bg-card p-4">
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-medium">Ad Prompt</label>
+            </div>
+            <div className="flex gap-2">
+              <Input
+                value={adPrompt}
+                onChange={(e) => setAdPrompt(e.target.value)}
+                placeholder="Describe your product, target audience, or specific requirements..."
+                className="flex-1"
+              />
+              <Button 
+                variant="outline" 
+                size="sm" 
+                disabled={isSavingPrompt}
+                className="flex items-center gap-2"
+              >
+                <Save className="h-4 w-4" />
+                {isSavingPrompt ? 'Saving...' : 'Save'}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Status */}
+        {isGenerating && (
+          <div className="mb-6 text-center">
+            <div className="flex items-center justify-center gap-2 text-muted-foreground">
+              <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+              Generating your ad variations... ({gridData?.progress.done || 0}/{gridData?.progress.total || 9})
+            </div>
+          </div>
+        )}
+
         {/* Toolbar */}
         <Toolbar
-          totalGenerated={totalGenerated}
-          selectedCount={selectedItems.size}
+          totalGenerated={gridData?.progress.done || 0}
+          selectedCount={selectedImages.length}
+          selectedImages={selectedImages.map(img => img.imageUrl)}
           onRegenerateAll={handleRegenerateAll}
           onBack={onBack}
-          onReset={() => apiService.reset()}
+          onReset={startGeneration}
         />
 
-        {/* Grid with Axis Labels */}
-        <div className="relative">
-          {/* Y-axis label */}
-          {gridData?.y_axis_label && (
-            <div className="absolute -left-16 top-1/2 -translate-y-1/2 -rotate-90 text-sm font-medium text-muted-foreground whitespace-nowrap">
-              {gridData.y_axis_label}
-            </div>
-          )}
-          
-          {/* X-axis label */}
-          {gridData?.x_axis_label && (
-            <div className="text-center mb-4">
-              <span className="text-sm font-medium text-muted-foreground">
-                {gridData.x_axis_label}
-              </span>
-            </div>
-          )}
-          
-          <div className="grid grid-cols-3 gap-4">
-          {gridItems.map((item, index) => (
-            <GridCell
-              key={item.id}
-              imageUrl={item.imageUrl}
-              isLoading={item.isLoading}
-              isSelected={selectedItems.has(item.id)}
-              onSelect={() => handleItemSelect(item.id)}
-              onRegenerate={() => handleItemRegenerate(item.id)}
-              onZoom={() => handleItemZoom(item.imageUrl, item.variations)}
-              onGenerateVariations={() => handleGenerateVariations(item.id)}
-              variations={item.variations}
-              isGeneratingVariations={item.isGeneratingVariations}
-              index={index}
-            />
-          ))}
+        {/* Grid */}
+        <div className="mt-8">
+          <div className="grid grid-cols-3 gap-4 max-w-4xl mx-auto">
+            {gridItems.map((item) => (
+              <GridCell
+                key={`${item.slot}-${item.version}-${item.updatedAt}`}
+                imageUrl={item.status === 'done' ? item.url : null}
+                isLoading={item.status !== 'done'}
+                isSelected={isImageSelected(item.slot)}
+                onSelect={() => item.status === 'done' && handleImageSelect(item.slot, item.url)}
+                onRegenerate={() => handleItemRegenerate(item.slot)}
+                onZoom={() => item.status === 'done' && handleItemZoom(item.url)}
+                onGenerateVariations={() => handleGenerateVariations(item.slot)}
+                index={item.slot - 1}
+                onSelectVariation={(variationIndex, imageUrl) => 
+                  handleImageSelect(item.slot, imageUrl, variationIndex)
+                }
+                isVariationSelected={(variationIndex) => 
+                  isImageSelected(item.slot, variationIndex)
+                }
+              />
+            ))}
           </div>
         </div>
       </div>
 
       {/* Image Preview Modal */}
-      {(previewImage || previewVariations) && (
+      {zoomedImage && (
         <ImagePreview
-          imageUrl={previewImage || undefined}
-          variations={previewVariations}
-          onClose={() => {
-            setPreviewImage(null);
-            setPreviewVariations(undefined);
+          imageUrl={zoomedImage.imageUrl}
+          variations={zoomedImage.variations}
+          onClose={() => setZoomedImage(null)}
+          selectedImages={selectedImages.map(img => ({
+            gridItemId: img.slot.toString(),
+            imageUrl: img.imageUrl,
+            variationIndex: img.variationIndex
+          }))}
+          gridItemId={gridItems.find(item => item.url === zoomedImage.imageUrl)?.slot.toString()}
+          onSelectVariation={(variationIndex, imageUrl) => {
+            const gridItem = gridItems.find(item => item.url === zoomedImage.imageUrl);
+            if (gridItem) {
+              handleImageSelect(gridItem.slot, imageUrl, variationIndex);
+            }
+          }}
+          isVariationSelected={(variationIndex) => {
+            const gridItem = gridItems.find(item => item.url === zoomedImage.imageUrl);
+            return gridItem ? isImageSelected(gridItem.slot, variationIndex) : false;
           }}
         />
       )}
     </div>
   );
 };
+
+export { AdGrid };

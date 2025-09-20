@@ -1,142 +1,281 @@
-import os
-import time
-import base64
-from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
-import requests
-import asyncio
+import os, io, time, shutil, json
+from typing import Dict, Optional, List
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from PIL import Image, ImageDraw
 
+# ===== Config =====
+IMAGES_DIR = "images"
+VARIATIONS_SUBDIR = "variations"  # images/variations/<slot>/<idx>.png
+META_PATH = os.path.join(IMAGES_DIR, "meta.json")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
-class FluxAdapter:
-    def __init__(
-        self,
-        *,
-        model: str,
-        use_raw_mode: bool,
-        api_key: Optional[str] = None,
-        base_url: str = "https://api.bfl.ai",
-        aspect_ratio: Optional[str] = "16:9",
-        width: int = 1024,
-        height: int = 1024,
-        safety_tolerance: int = 6,
-        prompt_upsampling: bool = False,
-        poll_timeout: int = 180,
-        connect_timeout: int = 10,
-        read_timeout: int = 120,
-        max_post_retries: int = 3,
-    ):
-        self.api_key = api_key or os.getenv("BFL_API_KEY")
-        if not self.api_key:
-            raise ValueError("BFL_API_KEY not set")
+app = FastAPI(title="AdGrid Single-Grid API", version="1.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.use_raw_mode = use_raw_mode
-        self.aspect_ratio = aspect_ratio
-        self.width = width
-        self.height = height
-        self.safety_tolerance = safety_tolerance
-        self.prompt_upsampling = prompt_upsampling
-        self.poll_timeout = poll_timeout
-        self.connect_timeout = connect_timeout
-        self.read_timeout = read_timeout
-        self.max_post_retries = max_post_retries
+# Serve /images/* statically
+app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
-        self._session = requests.Session()
-        self._session.headers.update({
-            "accept": "application/json",
-            "x-key": self.api_key,
-            "Content-Type": "application/json",
-        })
+# ===== Models =====
+class UploadResp(BaseModel):
+    input_url: str
+    input_path: str
+    prompt: Optional[str] = None  # NEW: echo back stored prompt
 
-    async def generate(self, prompt_text: str, *, input_image: Optional[str] = None, guidance_scale: Optional[float] = None) -> Tuple[str, Dict]:
-        return await asyncio.to_thread(self._generate_sync, prompt_text, input_image, guidance_scale)
+class GridResp(BaseModel):
+    status: str
+    rows: int
+    cols: int
+    progress: Dict[str, int]
+    input_url: Optional[str]
+    images: Dict[str, Optional[str]]
 
-    # ---------------- internal (sync) ----------------
+class RegenReq(BaseModel):
+    slots: List[int]
 
-    def _generate_sync(self, prompt_text: str, input_image: Optional[str], guidance_scale: Optional[float]) -> Tuple[str, Dict[str, Any]]:
-        payload: Dict[str, Any] = {
-            "prompt": prompt_text,
-            "safety_tolerance": self.safety_tolerance,
-            "prompt_upsampling": self.prompt_upsampling,
-            "raw": self.use_raw_mode,
-        }
+class VariationsGenerateReq(BaseModel):
+    count: int = 3  # how many new variations to create for this slot
 
-        if guidance_scale is not None:
-            payload["guidance_scale"] = guidance_scale
+class VariationsResp(BaseModel):
+    slot: int
+    urls: List[str]
 
-        # image+text support: use 'input_image' for Kontext models
-        if input_image:
-            payload["input_image"] = self._to_data_url_if_needed(input_image)
+class MetaResp(BaseModel):
+    prompt: Optional[str] = None
 
-        if self.aspect_ratio:
-            payload["aspect_ratio"] = self.aspect_ratio
+class MetaSetReq(BaseModel):
+    prompt: Optional[str] = None
+
+# ===== Helpers =====
+def input_path(ext="png"):
+    return os.path.join(IMAGES_DIR, f"input.{ext}")
+
+def slot_path(slot: int):
+    return os.path.join(IMAGES_DIR, f"{slot}.png")
+
+def var_dir(slot: int):
+    return os.path.join(IMAGES_DIR, VARIATIONS_SUBDIR, str(slot))
+
+def var_path(slot: int, idx: int):
+    return os.path.join(var_dir(slot), f"{idx}.png")
+
+def file_url(path: str) -> str:
+    ts = int(os.path.getmtime(path)) if os.path.exists(path) else int(time.time())
+    rel = os.path.relpath(path, ".").replace("\\", "/")
+    return f"/{rel}?ts={ts}"
+
+def placeholder_png(text="Generating…") -> bytes:
+    img = Image.new("RGB", (1024, 1024), (240, 240, 240))
+    d = ImageDraw.Draw(img)
+    d.text((24, 24), text, fill=(90, 90, 90))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def write_bytes(path: str, data: bytes):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+def read_meta() -> Dict[str, Optional[str]]:
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def write_meta(meta: Dict[str, Optional[str]]):
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def compute_grid(rows=3, cols=3) -> GridResp:
+    total = rows * cols
+    done = 0
+    images: Dict[str, Optional[str]] = {}
+    for i in range(1, total + 1):
+        p = slot_path(i)
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            done += 1
+            images[str(i)] = file_url(p)
         else:
-            payload["width"] = self.width
-            payload["height"] = self.height
+            images[str(i)] = None
+    status = "done" if done == total else ("running" if done > 0 else "queued")
+    inp_png = input_path("png")
+    inp_jpg = input_path("jpg")
+    inp = inp_png if os.path.exists(inp_png) else inp_jpg if os.path.exists(inp_jpg) else None
+    return GridResp(
+        status=status,
+        rows=rows,
+        cols=cols,
+        progress={"done": done, "total": total},
+        input_url=file_url(inp) if inp else None,
+        images=images,
+    )
 
-        endpoint = f"{self.base_url}/v1/{self.model}"
-        resp = self._post_with_retries(endpoint, payload)
-        data = resp.json()
-        request_id = data["id"]
-        polling_url = data.get("polling_url", f"{self.base_url}/v1/get_result")
+def clear_images_dir() -> dict:
+    count = 0
+    if os.path.exists(IMAGES_DIR):
+        for root, _, files in os.walk(IMAGES_DIR):
+            for fn in files:
+                try:
+                    os.remove(os.path.join(root, fn))
+                    count += 1
+                except Exception:
+                    pass
+        shutil.rmtree(IMAGES_DIR, ignore_errors=True)
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    return {"deleted_files": count, "folder": IMAGES_DIR}
 
-        result = self._poll_for_result(polling_url, request_id, self.poll_timeout)
-        sample = result.get("result", {}).get("sample")
-        if not sample:
-            raise RuntimeError(f"Missing sample in result: {result}")
+def list_variations(slot: int) -> List[str]:
+    d = var_dir(slot)
+    if not os.path.isdir(d):
+        return []
+    items = sorted(
+        [f for f in os.listdir(d) if f.endswith(".png")],
+        key=lambda name: int(os.path.splitext(name)[0]) if os.path.splitext(name)[0].isdigit() else 0
+    )
+    return [file_url(os.path.join(d, f)) for f in items]
 
-        meta = {
-            "request_id": request_id,
-            "model": self.model,
-            "result": result.get("result", {}),
-        }
-        return sample, meta
+# ===== Endpoints =====
 
-    def _post_with_retries(self, url: str, json_payload: Dict[str, Any]) -> requests.Response:
-        last_exc = None
-        for attempt in range(self.max_post_retries):
-            try:
-                resp = self._session.post(url, json=json_payload, timeout=(self.connect_timeout, self.read_timeout))
-                resp.raise_for_status()
-                return resp
-            except requests.exceptions.ReadTimeout as e:
-                last_exc = e
-            except requests.RequestException as e:
-                last_exc = e
-            time.sleep(1.5 * (attempt + 1))
-        assert last_exc is not None
-        raise last_exc
+@app.get("/meta", response_model=MetaResp)
+def get_meta():
+    """Return stored metadata like the prompt."""
+    m = read_meta()
+    return MetaResp(prompt=m.get("prompt"))
 
-    def _poll_for_result(self, polling_url: str, request_id: str, max_wait: int) -> Dict[str, Any]:
-        start = time.time()
-        while time.time() - start < max_wait:
-            time.sleep(0.5)
-            try:
-                r = self._session.get(polling_url, params={"id": request_id}, timeout=5)
-                r.raise_for_status()
-                result = r.json()
-            except requests.exceptions.Timeout:
-                continue
-            except requests.RequestException:
-                continue
+@app.post("/meta", response_model=MetaResp)
+def set_meta(body: MetaSetReq):
+    """Update stored metadata (e.g., prompt)."""
+    m = read_meta()
+    if body.prompt is not None:
+        m["prompt"] = body.prompt
+    write_meta(m)
+    return MetaResp(prompt=m.get("prompt"))
 
-            status = result.get("status")
-            if status == "Ready":
-                return result
-            if status in ("Error", "Failed"):
-                raise RuntimeError(f"Generation failed: {result}")
-        raise TimeoutError(f"Request {request_id} timed out after {max_wait}s")
+@app.post("/upload", response_model=UploadResp)
+async def upload_reference(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),  # NEW: accept prompt in multipart form
+):
+    """
+    Accepts an image file and optional text prompt (multipart form).
+    Saves image to images/input.png|jpg and writes prompt to images/meta.json.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(400, "File must be an image")
+    if file.content_type not in {"image/png", "image/jpeg"}:
+        raise HTTPException(400, "Only PNG or JPG allowed")
 
-    def _to_data_url_if_needed(self, path_or_url: str) -> str:
-        if path_or_url.startswith(("data:", "http://", "https://")):
-            return path_or_url
-        p = Path(path_or_url)
-        if not p.is_file():
-            return path_or_url
-        ext = p.suffix.lower().lstrip(".") or "png"
-        mime = "image/png" if ext == "png" else f"image/{ext}"
-        data = base64.b64encode(p.read_bytes()).decode("utf-8")
-        return f"data:{mime};base64,{data}"
+    raw = await file.read()
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.verify()
+    except Exception as e:
+        raise HTTPException(400, f"Invalid image: {e}")
 
+    ext = "png" if file.content_type == "image/png" else "jpg"
+    ipath = input_path(ext)
+    write_bytes(ipath, raw)
 
+    # Store/update metadata (prompt)
+    meta = read_meta()
+    meta["prompt"] = prompt
+    write_meta(meta)
+
+    return UploadResp(input_url=file_url(ipath), input_path=ipath, prompt=prompt)
+
+@app.post("/generate", response_model=GridResp)
+def generate_grid(rows: int = 3, cols: int = 3):
+    """
+    Generates 1..N placeholder images. Replace placeholder_png(...) with your model,
+    and pass the stored prompt from read_meta() if needed.
+    """
+    meta = read_meta()
+    # prompt = meta.get("prompt")  # available for your generator
+    total = rows * cols
+    for i in range(1, total + 1):
+        # bytes_out = your_model(prompt=prompt, ref=open(input_path("png"),"rb").read(), seed=i)
+        write_bytes(slot_path(i), placeholder_png(text=f"Slot {i}"))
+    return compute_grid(rows, cols)
+
+@app.get("/grid", response_model=GridResp)
+def get_grid(rows: int = 3, cols: int = 3):
+    return compute_grid(rows, cols)
+
+@app.post("/regenerate", response_model=GridResp)
+def regenerate_slots(req: RegenReq, rows: int = 3, cols: int = 3):
+    """
+    Overwrite specific base slots. You can use the saved prompt here too.
+    """
+    total = rows * cols
+    invalid = [s for s in req.slots if s < 1 or s > total]
+    if invalid:
+        raise HTTPException(400, f"Invalid slot numbers: {invalid}")
+    meta = read_meta()
+    # prompt = meta.get("prompt")
+    for s in req.slots:
+        # bytes_out = your_model(prompt=prompt, base=open(slot_path(s),"rb").read())
+        write_bytes(slot_path(s), placeholder_png(text=f"Regen {s}"))
+    return compute_grid(rows, cols)
+
+@app.delete("/reset")
+def reset_all():
+    info = clear_images_dir()
+    # also clear meta
+    if os.path.exists(META_PATH):
+        try:
+            os.remove(META_PATH)
+        except Exception:
+            pass
+    return {"ok": True, **info}
+
+# ----- Variations -----
+
+@app.post("/variations/{slot}/generate", response_model=VariationsResp)
+def generate_variations(slot: int, body: VariationsGenerateReq = VariationsGenerateReq()):
+    """
+    Create N new variations derived from images/{slot}.png using (optional) stored prompt.
+    Saves them under images/variations/{slot}/1.png, 2.png, ... (appends).
+    """
+    base = slot_path(slot)
+    if not os.path.exists(base):
+        raise HTTPException(404, f"Base image for slot {slot} not found. Generate the grid first.")
+
+    os.makedirs(var_dir(slot), exist_ok=True)
+
+    existing = list_variations(slot)
+    start_idx = len(existing) + 1
+
+    meta = read_meta()
+    # prompt = meta.get("prompt")
+
+    for i in range(start_idx, start_idx + max(1, body.count)):
+        # bytes_out = your_model_variation(base=open(base,"rb").read(), prompt=prompt, index=i)
+        png = placeholder_png(text=f"Var {slot}-{i}")
+        write_bytes(var_path(slot, i), png)
+
+    return VariationsResp(slot=slot, urls=list_variations(slot))
+
+@app.get("/variations/{slot}", response_model=VariationsResp)
+def get_variations(slot: int):
+    return VariationsResp(slot=slot, urls=list_variations(slot))
+
+@app.delete("/variations/{slot}")
+def delete_variations(slot: int):
+    d = var_dir(slot)
+    if os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+    return {"ok": True, "slot": slot, "cleared": True}

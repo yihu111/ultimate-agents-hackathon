@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 interface ToolbarProps {
   totalGenerated: number;
   selectedCount: number;
+  selectedImages: string[];
   onRegenerateAll: () => void;
   onBack: () => void;
   onReset?: () => void;
@@ -12,13 +13,43 @@ interface ToolbarProps {
 export const Toolbar = ({
   totalGenerated,
   selectedCount,
+  selectedImages,
   onRegenerateAll,
   onBack,
   onReset
 }: ToolbarProps) => {
-  const handleDownload = () => {
-    // TODO: Implement download functionality
-    console.log('Download selected images');
+  const handleDownload = async () => {
+    if (selectedImages.length === 0) return;
+
+    try {
+      // Download each selected image
+      for (let i = 0; i < selectedImages.length; i++) {
+        const imageUrl = selectedImages[i];
+        const response = await fetch(imageUrl);
+        const blob = await response.blob();
+        
+        // Create download link
+        const downloadUrl = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = `ad-variation-${i + 1}.jpg`;
+        
+        // Trigger download
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        
+        // Clean up object URL
+        window.URL.revokeObjectURL(downloadUrl);
+        
+        // Small delay between downloads to prevent browser issues
+        if (i < selectedImages.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    } catch (error) {
+      console.error('Download failed:', error);
+    }
   };
 
   return (

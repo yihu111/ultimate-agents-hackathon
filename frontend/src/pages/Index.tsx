@@ -7,10 +7,10 @@ const Index = () => {
   const [uploadResponse, setUploadResponse] = useState<any>(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const handleImageSelect = (file: File, uploadResponse: any) => {
+  const handleImageSelect = (file: File, uploadResponse: any, context?: string) => {
     setIsProcessing(true);
     setUploadedImage(file);
-    setUploadResponse(uploadResponse);
+    setUploadResponse({ ...uploadResponse, prompt: context });
     setIsProcessing(false);
   };
 
@@ -21,7 +21,14 @@ const Index = () => {
   };
 
   if (uploadedImage && uploadResponse) {
-    return <AdGrid uploadedImage={uploadedImage} uploadResponse={uploadResponse} onBack={handleBack} />;
+    return (
+      <AdGrid 
+        uploadedImage={uploadedImage} 
+        uploadResponse={uploadResponse} 
+        onBack={handleBack}
+        initialPrompt={uploadResponse.prompt}
+      />
+    );
   }
 
   return (
