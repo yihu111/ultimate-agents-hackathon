@@ -47,10 +47,11 @@ const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGrid
         initialItems.push({
           slot: i,
           variant: 0,
-          url: '',
+          url: null,
+          kind: "base",
           status: 'queued',
           version: 1,
-          updatedAt: new Date().toISOString(),
+          updatedAt: Date.now(),
         });
       }
       setGridItems(initialItems);
@@ -85,8 +86,8 @@ const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGrid
         return;
       }
       
-      // Continue polling every 1-2 seconds
-      setTimeout(pollGrid, 1500);
+      // Continue polling every 1200ms
+      setTimeout(pollGrid, 1200);
     } catch (error) {
       console.error('Polling failed:', error);
       setIsGenerating(false);
@@ -285,13 +286,13 @@ const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGrid
           <div className="grid grid-cols-3 gap-4 max-w-4xl mx-auto">
             {gridItems.map((item) => (
               <GridCell
-                key={`${item.slot}-${item.version}-${item.updatedAt}`}
-                imageUrl={item.status === 'done' ? item.url : null}
+                key={`${item.slot}-${item.version}`}
+                imageUrl={item.status === 'done' && item.url ? item.url : null}
                 isLoading={item.status !== 'done'}
                 isSelected={isImageSelected(item.slot)}
-                onSelect={() => item.status === 'done' && handleImageSelect(item.slot, item.url)}
+                onSelect={() => item.status === 'done' && item.url && handleImageSelect(item.slot, item.url)}
                 onRegenerate={() => handleItemRegenerate(item.slot)}
-                onZoom={() => item.status === 'done' && handleItemZoom(item.url)}
+                onZoom={() => item.status === 'done' && item.url && handleItemZoom(item.url)}
                 onGenerateVariations={() => handleGenerateVariations(item.slot)}
                 index={item.slot - 1}
                 onSelectVariation={(variationIndex, imageUrl) => 
