@@ -273,15 +273,15 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
     for part in getattr(human_msg, "content", []) or []:
         if isinstance(part, dict) and part.get("type") == "text":
             human_text_parts.append(part.get("text", ""))
-    combined_prompt = f"{PROMPT_SYSTEM}\n\n" + "\n".join(human_text_parts)
+    base_prompt = f"{PROMPT_SYSTEM}\n\n" + "\n".join(human_text_parts)
     if request.reference_image_path:
-        combined_prompt += f"\n\nReference image URL: {request.reference_image_path}\nWhen you call the Flux tool, pass this URL as input_image."
+        base_prompt += f"\n\nReference image URL: {request.reference_image_path}\nWhen you call the Flux tool, pass this URL as input_image."
 
     # Debug: print the exact prompt sent to the Dedalus agent for this slot
     try:
         print("\n================ [dedalus-combined-prompt] ================")
         print(f"slot={request.slot_index}  a={request.dim_a_value}  b={request.dim_b_value}")
-        print(combined_prompt)
+        print(base_prompt)
         print("================ [/dedalus-combined-prompt] ================\n")
     except Exception:
         pass
@@ -374,91 +374,121 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
             saved_path = src
         return saved_path
 
-    # 2) Call Dedalus with Flux MCP tool and parse {image_url}
-    client = AsyncDedalus()
-    runner = DedalusRunner(client)
-    final_text: str = ""
-    # Optional streaming (enable via env var DEDALUS_STREAM=1)
-    if os.getenv("DEDALUS_STREAM"):
-        events = []
-        seen_urls: set[str] = set()
-        try:
-            res = stream_async(runner.run(
-                input=combined_prompt,
-                model=request.model_spec["name"],
-                mcp_servers=["yihu/flux-mcp"],
-                stream=True,
-            ))
-            events_gen = res
-            if asyncio.iscoroutine(res):
-                events_gen = await res
-            if events_gen is None:
-                raise TypeError("stream_async returned None")
-            async for ev in events_gen:
-                try:
-                    # Best-effort console streaming of token deltas
-                    if isinstance(ev, dict) and ev.get("delta"):
-                        print(ev["delta"], end="", flush=True)
-                    # Surface tool-call events in logs if present
-                    if isinstance(ev, dict):
-                        label = ev.get("event") or ev.get("type")
-                        tool = ev.get("tool") or ev.get("tool_name")
-                        if label or tool:
-                            print(f"\n[dedalus-event] {label or 'event'} {tool or ''}")
-                    # Opportunistically detect image URLs/data in the event and emit/save immediately
-                    import re as _re
-                    blob = ev if isinstance(ev, str) else json.dumps(ev, ensure_ascii=False)
-                    m = _re.search(r"(https?://\S+|data:image/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+)", blob)
-                    if m:
-                        url = m.group(1)
-                        if url not in seen_urls:
-                            seen_urls.add(url)
-                            print(f"\n[image-url] {url}")
-                            try:
-                                saved_intermediate = _save_image(url)
-                                print(f"[image-saved] {saved_intermediate}")
-                                await _post_slot_update(request.slot_index, url, status="running")
-                            except Exception as _e:
-                                print(f"[image-save-error] {type(_e).__name__}: {_e}")
-                            _note_image_tool_call(url)
-                except Exception:
-                    pass
-                events.append(ev)
-        except Exception as e:
-            print(f"[streaming-disabled] {type(e).__name__}: {e}")
-        # Try to recover final output from events
-        for ev in reversed(events):
+    # 2) Attempts loop (self-healing)
+    MAX_ATTEMPTS = int(os.getenv("IMPROVE_ATTEMPTS", "2"))
+    NODE_TIMEOUT = float(os.getenv("DEDALUS_NODE_TIMEOUT", "180"))
+
+    async def _attempt_once(attempt_idx: int) -> str:
+        """Run one agent attempt and return a final image URL."""
+        combined_prompt = base_prompt
+        if attempt_idx > 1:
+            combined_prompt += (
+                "\n\nRetry guidance: simplify overlays and reduce prompt complexity to avoid visual errors."
+            )
+
+        client = AsyncDedalus()
+        runner = DedalusRunner(client)
+
+        async def _run_stream() -> str:
+            events = []
+            seen_urls: set[str] = set()
             try:
-                if isinstance(ev, dict) and isinstance(ev.get("final_output"), str) and ev["final_output"].strip():
-                    final_text = ev["final_output"].strip()
-                    break
-            except Exception:
-                continue
-        # Fallback to non-streaming one-shot if we didn't capture a final output
-        if not final_text:
+                res = stream_async(runner.run(
+                    input=combined_prompt,
+                    model=request.model_spec["name"],
+                    mcp_servers=["yihu/flux-mcp"],
+                    stream=True,
+                ))
+                events_gen = res
+                if asyncio.iscoroutine(res):
+                    events_gen = await res
+                if events_gen is None:
+                    raise TypeError("stream_async returned None")
+                async for ev in events_gen:
+                    try:
+                        if isinstance(ev, dict) and ev.get("delta"):
+                            print(ev["delta"], end="", flush=True)
+                        if isinstance(ev, dict):
+                            label = ev.get("event") or ev.get("type")
+                            tool = ev.get("tool") or ev.get("tool_name")
+                            if label or tool:
+                                print(f"\n[dedalus-event] {label or 'event'} {tool or ''}")
+                        import re as _re
+                        blob = ev if isinstance(ev, str) else json.dumps(ev, ensure_ascii=False)
+                        m = _re.search(r"(https?://\S+|data:image/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+)", blob)
+                        if m:
+                            url = m.group(1)
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                print(f"\n[image-url] {url}")
+                                try:
+                                    saved_intermediate = _save_image(url)
+                                    print(f"[image-saved] {saved_intermediate}")
+                                    await _post_slot_update(request.slot_index, url, status="running")
+                                except Exception as _e:
+                                    print(f"[image-save-error] {type(_e).__name__}: {_e}")
+                                _note_image_tool_call(url)
+                    except Exception:
+                        pass
+                    events.append(ev)
+            except Exception as e:
+                print(f"[streaming-disabled] {type(e).__name__}: {e}")
+
+            for ev in reversed(events):
+                try:
+                    if isinstance(ev, dict) and isinstance(ev.get("final_output"), str) and ev["final_output"].strip():
+                        return ev["final_output"].strip()
+                except Exception:
+                    continue
+
             resp = await runner.run(
                 input=combined_prompt,
                 model=request.model_spec["name"],
                 mcp_servers=["yihu/flux-mcp"],
                 stream=False,
             )
-            final_text = (resp.final_output or "").strip()
-    else:
-        resp = await runner.run(
-            input=combined_prompt,
-            model=request.model_spec["name"],
-            mcp_servers=["yihu/flux-mcp"],
-            stream=False,
-        )
-        final_text = (resp.final_output or "").strip()
-    try:
-        image_url = _extract_image_url(final_text)
-        print(f"\n[dedalus-final-url] {image_url}")
-        _note_image_tool_call(image_url)
-    except Exception as e:
-        # Post error status and bail out for this slot
+            return (resp.final_output or "").strip()
+
+        try:
+            final_text = await asyncio.wait_for(_run_stream(), timeout=NODE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError("tool/LLM run timed out")
+
+        try:
+            image_url = _extract_image_url(final_text)
+            print(f"\n[dedalus-final-url] {image_url}")
+            _note_image_tool_call(image_url)
+            return image_url
+        except Exception:
+            try:
+                from adapters.flux_adapter import FluxAdapter as _FluxAdapter
+                generator = _FluxAdapter(model=request.image_model, use_raw_mode=request.use_raw_mode)
+                img_path, _meta = await generator.generate(final_text, input_image=request.reference_image_path)
+                print(f"[fallback-flux] generated {img_path}")
+                return img_path
+            except Exception as e2:
+                raise RuntimeError(f"fallback generation failed: {e2}")
+
+    image_url: str | None = None
+    last_error: str | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            image_url = await _attempt_once(attempt)
+            break
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            print(f"[attempt {attempt}/{MAX_ATTEMPTS}] error: {last_error}")
+
+    if not image_url:
         await _post_slot_update(request.slot_index, url=None, status="error")
-        raise
+        return {
+            "results": [{
+                "dim_a_value": request.dim_a_value,
+                "dim_b_value": request.dim_b_value,
+                "prompt_text": base_prompt,
+                "img_path": "",
+            }]
+        }
 
     # 3) Persist outputs into run directories
     out_images = Path(request.images_dir)
@@ -478,7 +508,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
 
     # Save prompt text alongside
     prompt_filename = saved_path.stem + ".txt"
-    (out_prompts / prompt_filename).write_text(combined_prompt, encoding="utf-8")
+    (out_prompts / prompt_filename).write_text(base_prompt, encoding="utf-8")
     print(f"[prompt-saved] {out_prompts / prompt_filename}")
     try:
         with _IMAGE_COUNTER_LOCK:
@@ -492,7 +522,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
         "results": [{
             "dim_a_value": request.dim_a_value,
             "dim_b_value": request.dim_b_value,
-            "prompt_text": combined_prompt,
+            "prompt_text": base_prompt,
             "img_path": str(saved_path),
         }]
     }
@@ -526,16 +556,23 @@ def compile_graph():
     return builder.compile()
 
 # ---------------- FastAPI update helper ----------------
-BACKEND_BASE = os.getenv("BACKEND_BASE", "http://localhost:8000")
+BACKEND_BASE = os.getenv("BACKEND_BASE", "http://127.0.0.1:8000")
 WEBHOOK_SECRET = os.getenv("ADGRID_WEBHOOK_SECRET")
 
-async def _post_slot_update(slot_index: int, url: str, *, status: str) -> None:
+async def _post_slot_update(slot_index: int, url: str | None, *, status: str) -> None:
     headers = {"Content-Type": "application/json"}
     if WEBHOOK_SECRET:
         headers["x-adgrid-secret"] = WEBHOOK_SECRET
     payload = {"status": status, "url": url}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(f"{BACKEND_BASE}/slot/{slot_index}/status", headers=headers, json=payload)
-    except Exception:
-        pass
+            r = await c.post(f"{BACKEND_BASE}/slot/{slot_index}/status", headers=headers, json=payload)
+            if r.status_code >= 400:
+                try:
+                    print(f"[slot-update-error] {r.status_code} {await r.aread()}")
+                except Exception:
+                    print(f"[slot-update-error] {r.status_code}")
+            else:
+                print(f"[slot-update-ok] slot={slot_index} status={status} url={(url or '')[:80]}")
+    except Exception as e:
+        print(f"[slot-update-exception] {type(e).__name__}: {e}")
