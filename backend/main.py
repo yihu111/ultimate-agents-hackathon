@@ -1,47 +1,43 @@
 # main.py
 import io, os, time
 from typing import Dict, Optional, List, Literal
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
 from dotenv import load_dotenv
-from supabase import create_client, Client
 import httpx
+import asyncio
+import sys
+from pathlib import Path as _Path
+
+# Ensure project root on sys.path so imports like 'langgraph_workflow' work
+_PROJECT_ROOT = _Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# LangGraph (Dedalus-backed) workflow
+from langgraph_workflow.product_images_graph_dedalus import (
+    compile_graph as compile_dedalus_graph,
+    ProductImagesState as DedalusState,
+)
 
 # =========================================================
 # Load environment
 # =========================================================
 load_dotenv()
 
-# Supabase config
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-BUCKET = "images"  # ensure this bucket exists and is public
+## Supabase removed: using direct image URLs now; uploads no longer supported
 
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Set SUPABASE_URL and SUPABASE_ANON_KEY in your .env")
+## Upload helpers removed
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-def public_url(path: str) -> str:
-    """Public URL for a file in the 'images' bucket (bucket must be public)."""
-    base = SUPABASE_URL.rstrip("/")
-    return f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
-
-def supabase_upload_bytes(path: str, data: bytes, content_type: str) -> str:
-    """Upload bytes to Supabase Storage (upsert), return public URL."""
-    supabase.storage.from_(BUCKET).upload(
-        path, data, {"content-type": content_type, "upsert": True}
-    )
-    return public_url(path)
-
-# Agent config
-AGENT_BASE_URL = os.environ.get("AGENT_BASE_URL", "http://localhost:9000")
-AGENT_API_KEY = os.environ.get("AGENT_API_KEY")
 
 # Optional: shared secret for webhooks from agent
 WEBHOOK_SECRET = os.environ.get("ADGRID_WEBHOOK_SECRET")  # e.g., "super-secret"
+
+# (Optional/legacy) Agent config to keep other endpoints working
+AGENT_BASE_URL = os.environ.get("AGENT_BASE_URL", "http://localhost:9000")
+AGENT_API_KEY = os.environ.get("AGENT_API_KEY")
 
 # =========================================================
 # FastAPI setup
@@ -82,10 +78,7 @@ class ImageItem(BaseModel):
     updatedAt: int = 0
     meta: Optional[Dict] = None  # any metadata from the agent
 
-class UploadResp(BaseModel):
-    prompt: Optional[str]
-    input_url: Optional[str]
-    ingestion_id: Optional[str] = None
+## Upload response model removed; clients should call /generate directly with image_url
 
 class GridResp(BaseModel):
     status: ImageStatus
@@ -260,73 +253,78 @@ def set_meta(body: MetaSetReq):
         CURRENT_PROMPT = body.prompt
     return MetaResp(prompt=CURRENT_PROMPT)
 
-# =========================================================
-# Upload: save input to Supabase (images/input.png|jpg) + notify Agent
-# =========================================================
-@app.post("/upload", response_model=UploadResp)
-async def upload_reference(file: UploadFile = File(...), prompt: Optional[str] = Form(None)):
-    global CURRENT_PROMPT, CURRENT_INPUT_URL, CURRENT_INGESTION_ID, GRID_ITEMS, VAR_ITEMS
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File must be an image (png/jpeg/webp…)")
-
-    raw = await file.read()
-    try:
-        img = Image.open(io.BytesIO(raw)); img.verify()
-    except Exception as e:
-        raise HTTPException(400, f"Invalid image: {e}")
-
-    ext = "png" if file.content_type.endswith("png") else "jpg"
-    input_key = f"input.{ext}"
-
-    try:
-        CURRENT_INPUT_URL = supabase_upload_bytes(input_key, raw, file.content_type)
-    except Exception as e:
-        raise HTTPException(502, f"Supabase upload failed: {e}")
-
-    CURRENT_PROMPT = prompt
-    CURRENT_INGESTION_ID = None
-    GRID_ITEMS.clear()
-    VAR_ITEMS.clear()
-
-    # Optional: tell the agent where the input image lives
-    try:
-        CURRENT_INGESTION_ID = await AGENT.ingest_url(image_url=CURRENT_INPUT_URL, prompt=CURRENT_PROMPT)
-    except Exception:
-        CURRENT_INGESTION_ID = None  # fine for hackathon
-
-    return UploadResp(prompt=prompt, input_url=CURRENT_INPUT_URL, ingestion_id=CURRENT_INGESTION_ID)
+## Upload endpoint removed; clients should supply image_url to /generate
 
 # =========================================================
-# Generate grid via Agent (frontend then polls /grid)
+# Generate grid via LangGraph (Dedalus workflow)
+# This replaces the previous agent-backed /generate implementation.
+# The workflow will stream progressive URLs back by POSTing to
+# /slot/{slot}/status from inside the graph node.
 # =========================================================
 @app.post("/generate", response_model=GridResp)
-async def generate_grid(rows: int = 3, cols: int = 3):
-    global GRID_SHAPE
+async def generate_grid(rows: int = 3, cols: int = 3,
+                        prompt: Optional[str] = None,
+                        image_url: Optional[str] = None):
+    global GRID_SHAPE, CURRENT_PROMPT, CURRENT_INPUT_URL
     GRID_SHAPE["rows"], GRID_SHAPE["cols"] = rows, cols
     total = rows * cols
 
-    # mark as running immediately for UI
+    # Mark all base slots as running immediately for UI
     for slot in range(1, total + 1):
         base = _ensure_base(slot)
         base.status = "running"
         base.updatedAt = _now_ms()
 
-    try:
-        items = await AGENT.generate_grid(
-            rows=rows, cols=cols,
-            prompt=CURRENT_PROMPT,
-            ingestion_id=CURRENT_INGESTION_ID,
-            input_url=CURRENT_INPUT_URL,
-        )
-        for it in items:
-            GRID_ITEMS[it.slot] = it
-    except Exception as e:
-        raise HTTPException(502, f"Agent grid error: {e}")
+    # Remember inputs
+    if prompt is not None:
+        CURRENT_PROMPT = prompt.strip() or None
+    if image_url is not None:
+        CURRENT_INPUT_URL = image_url
+
+    # Guard: require a meaningful product description for relevant results
+    if not CURRENT_PROMPT or not CURRENT_PROMPT.strip():
+        raise HTTPException(400, "Missing prompt. Provide a short product description for relevant results.")
+    # Guard: require an image URL for this flow
+    if not CURRENT_INPUT_URL or not CURRENT_INPUT_URL.strip():
+        raise HTTPException(400, "Missing image_url. Provide a public image URL.")
+
+    # Build initial LangGraph state
+    model_name = os.getenv("TEST_OPENAI_MODEL", "gpt-4o")
+    image_model = os.getenv("TEST_FLUX_MODEL", "flux-kontext-max")
+    use_raw_mode = False
+
+    initial_state: DedalusState = {
+        "model_spec": {"name": model_name},
+        "product_description": CURRENT_PROMPT,
+        # Optional fields will be added conditionally below
+        "num_dimensions": 2,
+        "num_values_per_dim": 3,
+        # Image generation config
+        "image_model": image_model,
+        "use_raw_mode": use_raw_mode,
+        # Results aggregator
+        "results": [],
+    }
+
+    # Add optional extras only if present to satisfy type checker
+    if CURRENT_INPUT_URL:
+        initial_state["initial_image_path"] = CURRENT_INPUT_URL
+
+    async def _run_workflow():
+        try:
+            graph = compile_dedalus_graph()
+            await graph.ainvoke(initial_state)
+        except Exception as e:
+            # Log and continue; UI keeps polling /grid
+            print(f"[generate] workflow error: {e}")
+
+    # Fire-and-forget workflow; streaming happens via webhooks
+    asyncio.create_task(_run_workflow())
 
     prog = _progress(rows, cols)
     status = _grid_status(rows, cols)
     return GridResp(status=status, rows=rows, cols=cols, progress=prog,
-                    items=[GRID_ITEMS[s] for s in range(1, total + 1)])
+                    items=[_ensure_base(s) for s in range(1, total + 1)])
 
 # =========================================================
 # Poll grid (frontend polls this every ~1–2s)

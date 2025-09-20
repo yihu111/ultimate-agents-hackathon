@@ -10,8 +10,7 @@ import { toast } from 'sonner';
 import { ArrowLeft, Save } from 'lucide-react';
 
 interface AdGridProps {
-  uploadedImage: File;
-  uploadResponse: any;
+  imageUrl: string;
   onBack: () => void;
   initialPrompt?: string;
 }
@@ -22,7 +21,7 @@ interface SelectedImage {
   variationIndex?: number;
 }
 
-const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGridProps) => {
+const AdGrid = ({ imageUrl, onBack, initialPrompt }: AdGridProps) => {
   const [gridItems, setGridItems] = useState<ImageItem[]>([]);
   const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([]);
   const [gridData, setGridData] = useState<GridResponse | null>(null);
@@ -56,8 +55,8 @@ const AdGrid = ({ uploadedImage, uploadResponse, onBack, initialPrompt }: AdGrid
       }
       setGridItems(initialItems);
       
-      // Start generation
-      const response = await apiService.generateGrid(3, 3);
+      // Start generation with optional prompt and provided image URL
+      const response = await apiService.generateGrid(3, 3, adPrompt || undefined, imageUrl);
       setGridData(response);
       
       // If generation is complete immediately, update grid

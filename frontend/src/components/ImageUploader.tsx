@@ -1,62 +1,31 @@
 import { useState, useCallback } from 'react';
-import { Upload, ImageIcon } from 'lucide-react';
+import { Link as LinkIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { apiService } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
 interface ImageUploaderProps {
-  onImageSelect: (file: File, uploadResponse: any, context?: string) => void;
+  onStart: (imageUrl: string, context?: string) => void;
   isLoading?: boolean;
 }
 
-export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) => {
-  const [isDragOver, setIsDragOver] = useState(false);
+export const ImageUploader = ({ onStart, isLoading }: ImageUploaderProps) => {
+  const [imageUrl, setImageUrl] = useState('');
   const [context, setContext] = useState('');
   const { toast } = useToast();
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-  }, []);
-
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    
-    const files = Array.from(e.dataTransfer.files);
-    const imageFile = files.find(file => file.type.startsWith('image/'));
-    
-    if (imageFile) {
-      await handleFileUpload(imageFile);
-    }
-  }, []);
-
-  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file && file.type.startsWith('image/')) {
-      await handleFileUpload(file);
-    }
-  }, []);
-
-  const handleFileUpload = async (file: File) => {
+  const handleStart = useCallback(() => {
     try {
-      const uploadResponse = await apiService.uploadImage(file, context);
-      onImageSelect(file, uploadResponse, context);
+      if (!imageUrl.trim()) {
+        toast({ title: 'Missing image URL', description: 'Please enter a valid image URL.', variant: 'destructive' });
+        return;
+      }
+      onStart(imageUrl.trim(), context);
     } catch (error) {
-      console.error('Upload failed:', error);
-      toast({
-        title: "Upload Failed", 
-        description: "Failed to upload image. Please try again.",
-        variant: "destructive",
-      });
+      console.error('Start failed:', error);
+      toast({ title: 'Failed to start', description: 'Please check the image URL and try again.', variant: 'destructive' });
     }
-  };
+  }, [imageUrl, context, onStart, toast]);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-6">
@@ -66,7 +35,7 @@ export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) 
             AdGrid
           </h1>
           <p className="text-xl text-muted-foreground">
-            Upload your product image and generate multiple ad variations
+            Paste an image URL and generate multiple ad variations
           </p>
         </div>
 
@@ -86,62 +55,32 @@ export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) 
           />
         </div>
 
-        <div
-          className={cn(
-            "relative rounded-lg border-2 border-dashed border-grid-border bg-grid-bg p-12 transition-all duration-300",
-            isDragOver && "border-primary bg-grid-hover shadow-glow",
-            isLoading && "animate-pulse-glow"
-          )}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-        >
-          <div className="flex flex-col items-center justify-center space-y-6">
-            <div className="rounded-full bg-gradient-primary p-6">
-              {isLoading ? (
-                <div className="animate-spin">
-                  <Upload className="h-12 w-12 text-primary-foreground" />
-                </div>
-              ) : (
-                <ImageIcon className="h-12 w-12 text-primary-foreground" />
-              )}
-            </div>
-
-            <div className="text-center">
-              <h3 className="text-2xl font-semibold mb-2">
-                {isLoading ? 'Processing your image...' : 'Drop your product image here'}
-              </h3>
-              <p className="text-muted-foreground mb-6">
-                {isLoading ? 'Generating ad variations' : 'Supports PNG and JPG files up to 10MB'}
-              </p>
-
+        <div className={cn(
+          "relative rounded-lg border border-grid-border bg-grid-bg p-6 transition-all duration-300",
+          isLoading && "animate-pulse-glow"
+        )}>
+          <div className="space-y-4">
+            <label htmlFor="image-url" className="block text-sm font-medium text-foreground">Image URL</label>
+            <div className="flex gap-2">
               <input
-                type="file"
-                accept="image/png,image/jpeg,image/jpg"
-                onChange={handleFileSelect}
-                className="hidden"
-                id="image-upload"
+                id="image-url"
+                type="url"
+                placeholder="https://example.com/image.jpg"
+                className="flex-1 p-3 rounded-lg border border-grid-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+                value={imageUrl}
+                onChange={(e) => setImageUrl(e.target.value)}
                 disabled={isLoading}
               />
-              
-              <Button
-                asChild
-                variant="outline"
-                size="lg"
-                disabled={isLoading}
-                className="bg-gradient-glass backdrop-blur-sm border-grid-border hover:bg-grid-hover"
-              >
-                <label htmlFor="image-upload" className="cursor-pointer">
-                  <Upload className="mr-2 h-5 w-5" />
-                  Choose File
-                </label>
+              <Button onClick={handleStart} disabled={isLoading || !imageUrl.trim()} className="flex items-center gap-2">
+                <LinkIcon className="h-4 w-4" />
+                Generate
               </Button>
             </div>
           </div>
         </div>
 
         <div className="mt-6 text-center text-sm text-muted-foreground">
-          Your image will be processed securely and variations will be generated instantly
+          Your image URL will be used directly to generate variations; no uploads
         </div>
       </div>
     </div>

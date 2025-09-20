@@ -13,6 +13,7 @@ import uuid
 import shutil
 from urllib.parse import urlparse
 import requests
+import httpx
 from datetime import datetime
 import json
 
@@ -104,6 +105,7 @@ class PromptAndGenerateRequest(BaseModel):
     # Output directories (required for saving results)
     images_dir: str
     prompts_dir: str
+    slot_index: int
 
 
 # ---------- State ----------
@@ -235,8 +237,9 @@ async def split_to_variations(state: ProductImagesState):
     if not images_dir or not prompts_dir:
         raise RuntimeError("Output directories not initialized; did 'init_run_output' run?")
     sends: List[Send] = []
-    for va in dim_a_values:
-        for vb in dim_b_values:
+    for i, va in enumerate(dim_a_values):
+        for j, vb in enumerate(dim_b_values):
+            slot_index = i * len(dim_b_values) + j + 1
             req = PromptAndGenerateRequest(
                 model_spec=state["model_spec"],
                 product_description=state["product_description"],
@@ -250,6 +253,7 @@ async def split_to_variations(state: ProductImagesState):
                 reference_image_path=ref_img,
                 images_dir=images_dir,
                 prompts_dir=prompts_dir,
+                slot_index=slot_index,
             )
             sends.append(Send("prompt_and_generate", req))
     return sends
@@ -402,6 +406,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
                             try:
                                 saved_intermediate = _save_image(url)
                                 print(f"[image-saved] {saved_intermediate}")
+                                await _post_slot_update(request.slot_index, url, status="running")
                             except Exception as _e:
                                 print(f"[image-save-error] {type(_e).__name__}: {_e}")
                             _note_image_tool_call(url)
@@ -453,6 +458,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
     # Save image from URL/data/local path coming from Dedalus
     saved_path = _save_image(image_url)
     print(f"[image-saved] {saved_path}")
+    await _post_slot_update(request.slot_index, image_url, status="done")
 
     # Save prompt text alongside
     prompt_filename = saved_path.stem + ".txt"
@@ -502,3 +508,18 @@ def compile_graph():
     builder.add_edge("finalize", END)
 
     return builder.compile()
+
+# ---------------- FastAPI update helper ----------------
+BACKEND_BASE = os.getenv("BACKEND_BASE", "http://localhost:8000")
+WEBHOOK_SECRET = os.getenv("ADGRID_WEBHOOK_SECRET")
+
+async def _post_slot_update(slot_index: int, url: str, *, status: str) -> None:
+    headers = {"Content-Type": "application/json"}
+    if WEBHOOK_SECRET:
+        headers["x-adgrid-secret"] = WEBHOOK_SECRET
+    payload = {"status": status, "url": url}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{BACKEND_BASE}/slot/{slot_index}/status", headers=headers, json=payload)
+    except Exception:
+        pass
