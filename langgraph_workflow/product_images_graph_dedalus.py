@@ -274,6 +274,17 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
         if isinstance(part, dict) and part.get("type") == "text":
             human_text_parts.append(part.get("text", ""))
     combined_prompt = f"{PROMPT_SYSTEM}\n\n" + "\n".join(human_text_parts)
+    if request.reference_image_path:
+        combined_prompt += f"\n\nReference image URL: {request.reference_image_path}\nWhen you call the Flux tool, pass this URL as input_image."
+
+    # Debug: print the exact prompt sent to the Dedalus agent for this slot
+    try:
+        print("\n================ [dedalus-combined-prompt] ================")
+        print(f"slot={request.slot_index}  a={request.dim_a_value}  b={request.dim_b_value}")
+        print(combined_prompt)
+        print("================ [/dedalus-combined-prompt] ================\n")
+    except Exception:
+        pass
 
     # Helper: extract image_url JSON robustly
     def _extract_image_url(text: str) -> str:
@@ -375,7 +386,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
             res = stream_async(runner.run(
                 input=combined_prompt,
                 model=request.model_spec["name"],
-                mcp_servers=["wfoster/flux-mcp"],
+                mcp_servers=["yihu/flux-mcp"],
                 stream=True,
             ))
             events_gen = res
@@ -428,7 +439,7 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
             resp = await runner.run(
                 input=combined_prompt,
                 model=request.model_spec["name"],
-                mcp_servers=["wfoster/flux-mcp"],
+                mcp_servers=["yihu/flux-mcp"],
                 stream=False,
             )
             final_text = (resp.final_output or "").strip()
@@ -436,13 +447,18 @@ async def prompt_and_generate(request: PromptAndGenerateRequest) -> Dict:
         resp = await runner.run(
             input=combined_prompt,
             model=request.model_spec["name"],
-            mcp_servers=["wfoster/flux-mcp"],
+            mcp_servers=["yihu/flux-mcp"],
             stream=False,
         )
         final_text = (resp.final_output or "").strip()
-    image_url = _extract_image_url(final_text)
-    print(f"\n[dedalus-final-url] {image_url}")
-    _note_image_tool_call(image_url)
+    try:
+        image_url = _extract_image_url(final_text)
+        print(f"\n[dedalus-final-url] {image_url}")
+        _note_image_tool_call(image_url)
+    except Exception as e:
+        # Post error status and bail out for this slot
+        await _post_slot_update(request.slot_index, url=None, status="error")
+        raise
 
     # 3) Persist outputs into run directories
     out_images = Path(request.images_dir)

@@ -120,8 +120,9 @@ Final Output
 - This should just be the URL that the tool returned. Don't add any other explanations or anything after the JSON (note, this is ONLY when you are ready for final output; before this, your outputs should be tool calls)
  
 Tools Available (important)
-- You have access to an MCP server which has tools for generating images. The primary callable is named "flux_generate" and accepts a text prompt plus optional parameters (model, raw mode, sizes). You MUST call "flux_generate" with the prompt you wrote, then use its return value as the image URL.
+- You have access to an MCP server which has tools for generating images. The primary callable is named "flux_edit_image" and accepts a text prompt plus optional parameters (model, raw mode, sizes). You MUST call "flux_edit_image" with the prompt you wrote, then use its return value as the image URL.
 - Do NOT print the prompt text as your final output. Your final output must be ONLY the JSON object defined above.
+- You MUST use 'flux_edit_image' only, NOT the other tools -- and PASS the image URL you received (of the refererence image), along with your prompt starting with 'Use the uploaded image...' or whatever.
 """
 
 
