@@ -1,6 +1,6 @@
-import os, io, time, shutil
+import os, io, time, shutil, json
 from typing import Dict, Optional, List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -9,9 +9,10 @@ from PIL import Image, ImageDraw
 # ===== Config =====
 IMAGES_DIR = "images"
 VARIATIONS_SUBDIR = "variations"  # images/variations/<slot>/<idx>.png
+META_PATH = os.path.join(IMAGES_DIR, "meta.json")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
-app = FastAPI(title="AdGrid Single-Grid API", version="1.2.0")
+app = FastAPI(title="AdGrid Single-Grid API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,6 +28,7 @@ app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 class UploadResp(BaseModel):
     input_url: str
     input_path: str
+    prompt: Optional[str] = None  # NEW: echo back stored prompt
 
 class GridResp(BaseModel):
     status: str
@@ -45,6 +47,12 @@ class VariationsGenerateReq(BaseModel):
 class VariationsResp(BaseModel):
     slot: int
     urls: List[str]
+
+class MetaResp(BaseModel):
+    prompt: Optional[str] = None
+
+class MetaSetReq(BaseModel):
+    prompt: Optional[str] = None
 
 # ===== Helpers =====
 def input_path(ext="png"):
@@ -76,6 +84,20 @@ def write_bytes(path: str, data: bytes):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
+
+def read_meta() -> Dict[str, Optional[str]]:
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def write_meta(meta: Dict[str, Optional[str]]):
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def compute_grid(rows=3, cols=3) -> GridResp:
     total = rows * cols
@@ -126,9 +148,32 @@ def list_variations(slot: int) -> List[str]:
     return [file_url(os.path.join(d, f)) for f in items]
 
 # ===== Endpoints =====
+
+@app.get("/meta", response_model=MetaResp)
+def get_meta():
+    """Return stored metadata like the prompt."""
+    m = read_meta()
+    return MetaResp(prompt=m.get("prompt"))
+
+@app.post("/meta", response_model=MetaResp)
+def set_meta(body: MetaSetReq):
+    """Update stored metadata (e.g., prompt)."""
+    m = read_meta()
+    if body.prompt is not None:
+        m["prompt"] = body.prompt
+    write_meta(m)
+    return MetaResp(prompt=m.get("prompt"))
+
 @app.post("/upload", response_model=UploadResp)
-async def upload_reference(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+async def upload_reference(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),  # NEW: accept prompt in multipart form
+):
+    """
+    Accepts an image file and optional text prompt (multipart form).
+    Saves image to images/input.png|jpg and writes prompt to images/meta.json.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "File must be an image")
     if file.content_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(400, "Only PNG or JPG allowed")
@@ -143,12 +188,25 @@ async def upload_reference(file: UploadFile = File(...)):
     ext = "png" if file.content_type == "image/png" else "jpg"
     ipath = input_path(ext)
     write_bytes(ipath, raw)
-    return UploadResp(input_url=file_url(ipath), input_path=ipath)
+
+    # Store/update metadata (prompt)
+    meta = read_meta()
+    meta["prompt"] = prompt
+    write_meta(meta)
+
+    return UploadResp(input_url=file_url(ipath), input_path=ipath, prompt=prompt)
 
 @app.post("/generate", response_model=GridResp)
 def generate_grid(rows: int = 3, cols: int = 3):
+    """
+    Generates 1..N placeholder images. Replace placeholder_png(...) with your model,
+    and pass the stored prompt from read_meta() if needed.
+    """
+    meta = read_meta()
+    # prompt = meta.get("prompt")  # available for your generator
     total = rows * cols
     for i in range(1, total + 1):
+        # bytes_out = your_model(prompt=prompt, ref=open(input_path("png"),"rb").read(), seed=i)
         write_bytes(slot_path(i), placeholder_png(text=f"Slot {i}"))
     return compute_grid(rows, cols)
 
@@ -158,27 +216,38 @@ def get_grid(rows: int = 3, cols: int = 3):
 
 @app.post("/regenerate", response_model=GridResp)
 def regenerate_slots(req: RegenReq, rows: int = 3, cols: int = 3):
+    """
+    Overwrite specific base slots. You can use the saved prompt here too.
+    """
     total = rows * cols
     invalid = [s for s in req.slots if s < 1 or s > total]
     if invalid:
         raise HTTPException(400, f"Invalid slot numbers: {invalid}")
+    meta = read_meta()
+    # prompt = meta.get("prompt")
     for s in req.slots:
+        # bytes_out = your_model(prompt=prompt, base=open(slot_path(s),"rb").read())
         write_bytes(slot_path(s), placeholder_png(text=f"Regen {s}"))
     return compute_grid(rows, cols)
 
 @app.delete("/reset")
 def reset_all():
     info = clear_images_dir()
+    # also clear meta
+    if os.path.exists(META_PATH):
+        try:
+            os.remove(META_PATH)
+        except Exception:
+            pass
     return {"ok": True, **info}
 
-# ----- NEW: Variations -----
+# ----- Variations -----
 
 @app.post("/variations/{slot}/generate", response_model=VariationsResp)
 def generate_variations(slot: int, body: VariationsGenerateReq = VariationsGenerateReq()):
     """
-    Create N new variations derived from images/{slot}.png.
-    Saves them under images/variations/{slot}/1.png, 2.png, ... (appends new indices).
-    Swap placeholder generation with your real model using the chosen slot as a reference.
+    Create N new variations derived from images/{slot}.png using (optional) stored prompt.
+    Saves them under images/variations/{slot}/1.png, 2.png, ... (appends).
     """
     base = slot_path(slot)
     if not os.path.exists(base):
@@ -186,13 +255,14 @@ def generate_variations(slot: int, body: VariationsGenerateReq = VariationsGener
 
     os.makedirs(var_dir(slot), exist_ok=True)
 
-    # determine next index to append (existing count + 1)
     existing = list_variations(slot)
     start_idx = len(existing) + 1
 
-    # Generate 'count' new variations
+    meta = read_meta()
+    # prompt = meta.get("prompt")
+
     for i in range(start_idx, start_idx + max(1, body.count)):
-        # TODO: replace with real variation bytes from your model using `base` as input
+        # bytes_out = your_model_variation(base=open(base,"rb").read(), prompt=prompt, index=i)
         png = placeholder_png(text=f"Var {slot}-{i}")
         write_bytes(var_path(slot, i), png)
 
