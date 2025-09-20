@@ -6,12 +6,13 @@ import { apiService } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
 interface ImageUploaderProps {
-  onImageSelect: (file: File, uploadResponse: any) => void;
+  onImageSelect: (file: File, uploadResponse: any, context?: string) => void;
   isLoading?: boolean;
 }
 
 export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) => {
   const [isDragOver, setIsDragOver] = useState(false);
+  const [context, setContext] = useState('');
   const { toast } = useToast();
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -45,8 +46,8 @@ export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) 
 
   const handleFileUpload = async (file: File) => {
     try {
-      const uploadResponse = await apiService.uploadImage(file);
-      onImageSelect(file, uploadResponse);
+      const uploadResponse = await apiService.uploadImage(file, context);
+      onImageSelect(file, uploadResponse, context);
     } catch (error) {
       console.error('Upload failed:', error);
       toast({
@@ -67,6 +68,22 @@ export const ImageUploader = ({ onImageSelect, isLoading }: ImageUploaderProps) 
           <p className="text-xl text-muted-foreground">
             Upload your product image and generate multiple ad variations
           </p>
+        </div>
+
+        {/* Context Input */}
+        <div className="mb-6">
+          <label htmlFor="context" className="block text-sm font-medium text-foreground mb-2">
+            Product Context (Optional)
+          </label>
+          <textarea
+            id="context"
+            value={context}
+            onChange={(e) => setContext(e.target.value)}
+            placeholder="Describe your product, target audience, or any specific requirements for the ad variations..."
+            className="w-full p-3 rounded-lg border border-grid-border bg-grid-bg text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+            rows={3}
+            disabled={isLoading}
+          />
         </div>
 
         <div

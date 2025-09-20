@@ -3,6 +3,12 @@ import { Check, RotateCcw, ZoomIn, Loader2, Grid3X3 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
+interface SelectedImage {
+  gridItemId: string;
+  imageUrl: string;
+  variationIndex?: number;
+}
+
 interface GridCellProps {
   imageUrl?: string;
   isLoading?: boolean;
@@ -14,6 +20,9 @@ interface GridCellProps {
   variations?: string[];
   isGeneratingVariations?: boolean;
   index: number;
+  selectedImages?: SelectedImage[];
+  onSelectVariation?: (variationIndex: number, imageUrl: string) => void;
+  isVariationSelected?: (variationIndex: number) => boolean;
 }
 
 export const GridCell = ({
@@ -26,7 +35,10 @@ export const GridCell = ({
   onGenerateVariations,
   variations,
   isGeneratingVariations,
-  index
+  index,
+  selectedImages,
+  onSelectVariation,
+  isVariationSelected
 }: GridCellProps) => {
   const [isHovered, setIsHovered] = useState(false);
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -59,16 +71,30 @@ export const GridCell = ({
       {variations && variations.length > 0 && (
         <div className="grid grid-cols-2 gap-0.5 h-full w-full">
           {variations.map((variationUrl, idx) => (
-            <img
+            <div
               key={idx}
-              src={variationUrl}
-              alt={`Variation ${idx + 1}`}
-              className={cn(
-                "h-full w-full object-cover transition-all duration-300",
-                isHovered && "scale-105"
+              className="relative group/variation cursor-pointer"
+              onClick={() => onSelectVariation?.(idx, variationUrl)}
+            >
+              <img
+                src={variationUrl}
+                alt={`Variation ${idx + 1}`}
+                className={cn(
+                  "h-full w-full object-cover transition-all duration-300",
+                  isHovered && "scale-105",
+                  isVariationSelected?.(idx) && "ring-2 ring-accent ring-inset"
+                )}
+                onLoad={() => setImageLoaded(true)}
+              />
+              {/* Selection indicator for individual variations */}
+              {isVariationSelected?.(idx) && (
+                <div className="absolute top-1 left-1 rounded-full bg-accent p-0.5">
+                  <Check className="h-3 w-3 text-accent-foreground" />
+                </div>
               )}
-              onLoad={() => setImageLoaded(true)}
-            />
+              {/* Hover overlay for variations */}
+              <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/variation:opacity-100 transition-opacity duration-200" />
+            </div>
           ))}
         </div>
       )}
